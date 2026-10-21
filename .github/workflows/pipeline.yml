@@ -17,6 +17,10 @@ on:
         description: Recheck published editions for changed files
         type: boolean
         default: false
+      only:
+        description: Limit to these ICAO codes, comma-separated (for testing)
+        type: string
+        default: ""
 
 concurrency:
   group: pipeline
@@ -47,6 +51,7 @@ jobs:
           --previous "${{ vars.PUBLIC_BASE_URL }}"
           --contact "${{ vars.CONTACT }}"
           ${{ inputs.refresh && '--refresh' || '' }}
+          ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
 
       - name: Install rclone
         run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
