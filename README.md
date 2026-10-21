@@ -7,9 +7,13 @@ Builds the data the ImgMap app reads: each country's AIP charts, mirrored and ge
 - **Costs about nothing.** A scheduled GitHub Actions job plus Cloudflare R2 (no egress fees). The output is a plain directory, so a VPS with any web server works too.
 
 ```
-GitHub Actions (daily) → python -m imgmap_backend.pipeline → out/ → rclone → R2 (public)
-                                                                         ↑ apps read JSON + PDFs
+GitHub Actions (daily) → python -m imgmap_backend.pipeline --publish-r2 → R2 (public, behind Cloudflare's cache)
+                                  each file uploaded as soon as it's written      ↑ apps read JSON + PDFs
 ```
+
+Results are published as they're produced: PDFs as they download, each aerodrome's chart list when it's done, and the airway network when it's built. A run that's cancelled or times out loses nothing. Each run has a time budget (`--max-minutes`); when it runs out, the progress record is saved and the workflow queues a follow-on run that resumes. A big first run is simply split across several runs.
+
+**What apps see:** an edition is listed in `editions.json` once it's complete. While a country has no complete edition yet (its first run), the edition being built is listed straight away and fills in as aerodromes finish.
 
 ## Running locally
 
@@ -84,9 +88,15 @@ Test it with `--country <id> --only <ICAO>`.
 ## Setting up hosting
 
 ### Cloudflare R2 (recommended)
-1. Create a Cloudflare account and an R2 bucket (e.g. `imgmap`). R2 asks for a payment method, but this usage stays within the free tier (10 GB storage, no egress fees).
-2. Make the bucket public: *Settings → Public access*. Either enable the `r2.dev` URL or connect a custom domain (recommended, as it gets the CDN cache).
-3. Create an API token: *R2 → Manage API tokens*, with Object Read & Write on the bucket.
+1. **Turn on R2** (*R2 Object Storage*). It asks for a payment method, but this usage stays within the free tier: 10 GB of storage, no egress fees.
+2. **Create a bucket**, e.g. `imgmap`.
+3. **Connect a custom domain** in the bucket's *Settings → Custom Domains* (live: `charts.daniyaalkhan.com`). Leave the `r2.dev` URL disabled: it's throttled, uncached, and can't take security rules.
+4. **Create an API token:** *R2 → Manage API tokens*, Object Read & Write, scoped to the bucket only.
+5. **Cache everything:** on the zone, *Caching → Cache Rules*, for the hostname, set *Eligible for cache* with Edge TTL *Use cache-control header if present*. Cloudflare doesn't cache JSON by default; with this rule, a flood of requests is answered from cache and never reaches (or bills) R2.
+6. **Rate limit:** *Security → WAF → Rate limiting rules*, for the hostname, per IP, more than 100 requests per 10 seconds → block. Normal app use is a few requests when a chart list opens, plus one per chart downloaded.
+7. **Billing alert:** *Notifications*, usage-based billing. R2 has no hard spending cap.
+
+Don't enable **Bot Fight Mode** on this hostname: it challenges non-browser clients, which includes the app.
 
 ### GitHub Actions
 Push this repository to GitHub. Public is recommended: unlimited Actions minutes, and there's nothing secret in it. Then add, under *Settings → Secrets and variables → Actions*:
@@ -100,7 +110,7 @@ Push this repository to GitHub. Public is recommended: unlimited Actions minutes
 | variable | `PUBLIC_BASE_URL` | e.g. `https://data.example.com/` |
 | variable | `CONTACT` | an email address, sent to AIS servers in the User-Agent |
 
-Run the workflow once by hand (*Actions → pipeline → Run workflow*). The first full run downloads every chart (a few GB, one to two hours); later runs only fetch what changed.
+Run the workflow once by hand (*Actions → pipeline → Run workflow*). The first full run downloads every chart, a few GB over several hours, split across runs that queue each other. Later runs only fetch what changed. To test, give the run an `only` value, e.g. `VIDP`.
 
 ### VPS instead
 The pipeline only needs Python and writes a directory. Serve `out/` with any web server (Caddy, nginx) and run from cron:

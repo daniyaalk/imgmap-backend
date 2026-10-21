@@ -2,3 +2,4 @@ lxml>=6.0
 numpy>=2.0
 pypdfium2>=5.0
 requests>=2.32
+boto3>=1.34

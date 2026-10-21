@@ -1,7 +1,8 @@
-# Builds the dataset and publishes it to Cloudflare R2.
+# Builds the dataset and publishes it to Cloudflare R2 as it goes.
 #
 # Runs daily; a run only reaches the eAIPs for new editions (or after
-# ALGORITHM_VERSION is bumped), so most days it is a single request.
+# ALGORITHM_VERSION is bumped), so most days it is a single request. A big
+# first run is split across several, each resuming where the last stopped.
 #
 # Repository settings needed (see README):
 #   secrets  R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
@@ -26,6 +27,10 @@ concurrency:
   group: pipeline
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write # to queue a follow-on run
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -44,36 +49,27 @@ jobs:
       - name: Tests
         run: python -m pytest -q tests
 
-      - name: Build
+      - name: Build and publish
+        # Each file is uploaded to R2 as soon as it's written, so a stopped
+        # run loses nothing. A run stops cleanly at its time budget and the
+        # next step queues a follow-on run that resumes.
+        env:
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: >
           python -m imgmap_backend.pipeline
           --out out
+          --publish-r2
+          --max-minutes 300
           --previous "${{ vars.PUBLIC_BASE_URL }}"
           --contact "${{ vars.CONTACT }}"
           ${{ inputs.refresh && '--refresh' || '' }}
           ${{ inputs.only && format('--only {0}', inputs.only) || '' }}
 
-      - name: Install rclone
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
-
-      - name: Publish
+      - name: Continue if unfinished
+        if: hashFiles('out/.incomplete') != '' && !inputs.only
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
-          BUCKET: ${{ vars.R2_BUCKET }}
-        run: |
-          # PDFs are content-addressed: never change, cache forever.
-          if [ -d out/pdf ]; then
-            rclone copy out/pdf "r2:$BUCKET/pdf" --immutable --transfers 8 \
-              --header-upload "Cache-Control: public, max-age=31536000, immutable" \
-              --header-upload "Content-Type: application/pdf"
-          fi
-          # Data next; the edition lists that point at it go last, so apps
-          # never see an edition whose files aren't all there yet.
-          JSON=(--header-upload "Cache-Control: public, max-age=300" --header-upload "Content-Type: application/json")
-          rclone copy out/v1 "r2:$BUCKET/v1" --exclude "*/editions.json" --exclude "countries.json" "${JSON[@]}"
-          rclone copy out/v1 "r2:$BUCKET/v1" --include "*/editions.json" --include "countries.json" "${JSON[@]}"
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pipeline --ref "${{ github.ref_name }}"

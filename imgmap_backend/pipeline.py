@@ -39,6 +39,7 @@ from .countries import Country, all_countries
 from .eaip import MAP_CATEGORIES, AipError, ChartRef, Edition, EaipSource, PoliteClient, parse_route_page
 from .geo import Georeference
 from .pdfpage import extract_page
+from .publish import Publisher, R2Publisher
 
 SCHEMA = 1
 log = logging.getLogger("pipeline")
@@ -59,6 +60,9 @@ class State:
         self.files: dict = data.get("files", {})
         # "<country>|<edition>" -> algorithm version it was fully published with
         self.editions: dict = data.get("editions", {})
+        # "<country>|<edition>" -> {icao: summary} for an edition still being
+        # built: a run that runs out of time resumes from here.
+        self.progress: dict = data.get("progress", {})
 
     def to_json(self):
         return {
@@ -67,12 +71,18 @@ class State:
             "charts": self.charts,
             "files": self.files,
             "editions": self.editions,
+            "progress": self.progress,
         }
 
 
 def load_state(previous: str | None, out: Path) -> tuple[State, str | None]:
-    """State from a previous publication (URL or directory). Returns the
-    state and, for URLs, the base to fetch mirrored PDFs from."""
+    """State from a previous publication: the bucket itself when publishing
+    there (never a cached copy), else a URL or directory. Returns the state
+    and, for URLs, the base to fetch mirrored PDFs from."""
+    stored = Output.publisher.get("v1/state.json")
+    if stored is not None:
+        log.info("Resuming from the published state")
+        return State(json.loads(stored)), previous
     if previous is None:
         local = out / "v1" / "state.json"
         return (State(json.loads(local.read_text())) if local.exists() else State()), None
@@ -165,6 +175,9 @@ class ChartProcessor:
         local = self.out / "pdf" / f"{sha}.pdf"
         if local.exists():
             return local.read_bytes()
+        stored = Output.publisher.get(f"pdf/{sha}.pdf")
+        if stored is not None and hashlib.sha256(stored).hexdigest() == sha:
+            return stored
         if self.mirror:
             r = requests.get(urljoin(self.mirror, f"pdf/{sha}.pdf"), timeout=120)
             if r.status_code == 200 and hashlib.sha256(r.content).hexdigest() == sha:
@@ -188,9 +201,8 @@ class ChartProcessor:
             sha, size = hashlib.sha256(data).hexdigest(), len(data)
             self.state.files[key] = {"fingerprint": fingerprint, "sha256": sha, "bytes": size}
         pdf_path = self.out / "pdf" / f"{sha}.pdf"
-        if data is not None and not pdf_path.exists():
-            pdf_path.parent.mkdir(parents=True, exist_ok=True)
-            pdf_path.write_bytes(data)
+        if data is not None:
+            write_pdf(pdf_path, data)
 
         cached = self.state.charts.get(sha)
         if cached and cached.get("algorithm") == gr.ALGORITHM_VERSION:
@@ -198,9 +210,6 @@ class ChartProcessor:
         else:
             if data is None:
                 data = self._pdf_bytes(sha, chart)
-                if not pdf_path.exists():
-                    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-                    pdf_path.write_bytes(data)
             page, result = georeference_pdf(data, points)
             self.stats["georeferenced"] += 1
             # A revision counter apps compare to know their copy is stale.
@@ -230,10 +239,12 @@ def build_enroute(source: EaipSource, edition: Edition) -> dict:
                 log.warning("Route page %s: %s", name, e)
                 return [], name
 
-        for routes, failed in pool.map(fetch, pages):
+        for n, (routes, failed) in enumerate(pool.map(fetch, pages), 1):
             parsed.extend(routes)
             if failed:
                 unread.append(failed)
+            if n % 100 == 0:
+                log.info("  %s en-route: %d of %d route pages", edition.name, n, len(pages))
 
     points, index = [], {}
 
@@ -281,11 +292,32 @@ def build_enroute(source: EaipSource, edition: Edition) -> dict:
 # --- Run -------------------------------------------------------------------
 
 
+class Output:
+    """The output directory, and where each file is published as soon as
+    it's written."""
+
+    root: Path = Path("out")
+    publisher: Publisher = Publisher()
+
+    @classmethod
+    def publish(cls, path: Path):
+        cls.publisher.put(path.relative_to(cls.root).as_posix(), path.read_bytes())
+
+
 def write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
     tmp.replace(path)
+    Output.publish(path)
+
+
+def write_pdf(path: Path, data: bytes):
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    Output.publish(path)
 
 
 def editions_to_publish(source: EaipSource) -> list[Edition]:
@@ -299,43 +331,89 @@ def editions_to_publish(source: EaipSource) -> list[Edition]:
     return sorted(keep, key=lambda e: e.effective)
 
 
-def run_country(country: Country, out: Path, state: State, mirror, only, client, refresh=False) -> dict:
+class OutOfTime(Exception):
+    """The run's time budget is used up; the next run carries on."""
+
+
+def save_state(state: State, out: Path):
+    write_json(out / "v1" / "state.json", {**state.to_json(), "generatedAt": datetime.now(timezone.utc).isoformat()})
+
+
+def run_country(country: Country, out: Path, state: State, mirror, only, client, refresh=False, deadline=None) -> dict:
+    """Builds the country's editions. Raises OutOfTime when the budget runs
+    out, with progress saved in `state`."""
     source = EaipSource(country, client)
     editions = editions_to_publish(source)
     log.info("%s: editions %s", country.country, [e.name for e in editions])
     processor = ChartProcessor(source, state, out, mirror)
-    for edition in editions:
-        done_key = f"{country.id}|{edition.id}"
-        # A published edition doesn't change; skip it unless the algorithm
-        # improved (or a refresh is forced), keeping daily runs to one request.
-        if not only and not refresh and state.editions.get(done_key) == gr.ALGORITHM_VERSION:
-            log.info("%s %s: already published", country.country, edition.name)
-            continue
-        base = out / "v1" / country.id / edition.id
-        aerodromes = source.aerodromes(edition)
-        if only:
-            aerodromes = [a for a in aerodromes if a in only]
-        summary = []
-        for icao in aerodromes:
-            started = time.time()
-            charts = source.charts(icao, edition)
-            points = source.points(icao, edition) if charts else None
-            entries = []
-            with ThreadPoolExecutor(2) as pool:
-                for entry in pool.map(lambda c: _safe(processor, c, points), charts):
-                    entries.append(entry)
-            write_json(base / "ad" / f"{icao}.json", {"schema": SCHEMA, "icao": icao, "edition": edition.id, "charts": entries})
-            usable = sum(1 for e in entries if "georef" in e)
-            summary.append({"icao": icao, "charts": len(entries), "usable": usable})
-            log.info("%s %s: %d charts, %d usable (%.0fs)", edition.name, icao, len(entries), usable, time.time() - started)
-        write_json(base / "aerodromes.json", {"schema": SCHEMA, "aerodromes": summary})
-        enroute = build_enroute(source, edition)
-        write_json(base / "enroute.json", enroute)
-        log.info("%s en-route: %d routes, %d points", edition.name, len(enroute["routes"]), len(enroute["points"]))
-        if not only:
-            state.editions[done_key] = gr.ALGORITHM_VERSION
-    log.info("%s: %s; %d eAIP requests", country.country, processor.stats, client.requests)
-    return {"editions": [{"id": e.id, "name": e.name, "effective": e.effective} for e in editions]}
+
+    def check_time():
+        if deadline is not None and time.time() > deadline:
+            raise OutOfTime()
+
+    built = []
+    last_save = time.time()
+
+    def listing(extra=None):
+        """Editions apps may use: complete ones; or, while the country has
+        none complete yet, the one being built, so it fills in as it goes."""
+        complete = [e for e in editions if f"{country.id}|{e.id}" in state.editions or e.id in built]
+        shown = complete or ([extra] if extra else [])
+        return {"editions": [{"id": e.id, "name": e.name, "effective": e.effective} for e in shown]}
+
+    try:
+        for edition in editions:
+            done_key = f"{country.id}|{edition.id}"
+            # A published edition doesn't change; skip it unless the algorithm
+            # improved (or a refresh is forced), keeping daily runs to one request.
+            if not only and not refresh and state.editions.get(done_key) == gr.ALGORITHM_VERSION:
+                log.info("%s %s: already published", country.country, edition.name)
+                continue
+            base = out / "v1" / country.id / edition.id
+            aerodromes = source.aerodromes(edition)
+            if only:
+                aerodromes = [a for a in aerodromes if a in only]
+            done = {} if only else state.progress.setdefault(done_key, {})
+            if done:
+                log.info("%s: resuming, %d of %d aerodromes already done", edition.name, len(done), len(aerodromes))
+            for n, icao in enumerate(aerodromes, 1):
+                if icao in done:
+                    continue
+                check_time()
+                started = time.time()
+                charts = source.charts(icao, edition)
+                points = source.points(icao, edition) if charts else None
+                entries = []
+                with ThreadPoolExecutor(2) as pool:
+                    for entry in pool.map(lambda c: _safe(processor, c, points), charts):
+                        entries.append(entry)
+                        if len(entries) % 25 == 0:
+                            log.info("  %s: %d of %d charts (%.0fs)", icao, len(entries), len(charts), time.time() - started)
+                write_json(base / "ad" / f"{icao}.json", {"schema": SCHEMA, "icao": icao, "edition": edition.id, "charts": entries})
+                usable = sum(1 for e in entries if "georef" in e)
+                done[icao] = {"icao": icao, "charts": len(entries), "usable": usable}
+                summary = [done[a] for a in aerodromes if a in done]
+                write_json(base / "aerodromes.json", {"schema": SCHEMA, "aerodromes": summary})
+                if len(done) == 1 or not only:
+                    write_json(out / "v1" / country.id / "editions.json", {"schema": SCHEMA, **listing(edition)})
+                # Progress survives a cancelled run on a fresh machine.
+                if not only and time.time() - last_save > 300:
+                    save_state(state, out)
+                    last_save = time.time()
+                log.info("[%d/%d] %s %s: %d charts, %d usable (%.0fs)", n, len(aerodromes), edition.name, icao, len(entries), usable, time.time() - started)
+            check_time()
+            summary = [done[a] for a in aerodromes if a in done]
+            write_json(base / "aerodromes.json", {"schema": SCHEMA, "aerodromes": summary})
+            enroute = build_enroute(source, edition)
+            write_json(base / "enroute.json", enroute)
+            log.info("%s en-route: %d routes, %d points", edition.name, len(enroute["routes"]), len(enroute["points"]))
+            built.append(edition.id)
+            if not only:
+                state.editions[done_key] = gr.ALGORITHM_VERSION
+                state.progress.pop(done_key, None)
+    finally:
+        log.info("%s: %s; %d eAIP requests", country.country, processor.stats, client.requests)
+    return listing()
 
 
 def _safe(processor: ChartProcessor, chart: ChartRef, points) -> dict:
@@ -354,17 +432,28 @@ def main(argv=None):
     ap.add_argument("--previous", help="URL or directory of the last publication")
     ap.add_argument("--contact", help="contact address sent to eAIP servers")
     ap.add_argument("--refresh", action="store_true", help="recheck published editions for changed files")
+    ap.add_argument("--max-minutes", type=float, help="stop cleanly after this long; the next run resumes")
+    ap.add_argument("--publish-r2", action="store_true", help="upload each file to R2 as it's written (R2_* environment variables)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
+    Output.root = args.out
+    if args.publish_r2:
+        Output.publisher = R2Publisher.from_env()
+    write_json(args.out / "v1" / "countries.json", {"schema": SCHEMA, "countries": [c.to_json() for c in all_countries()]})
     state, mirror = load_state(args.previous, args.out)
     client = PoliteClient(contact=args.contact)
     only = set(args.only.split(",")) if args.only else None
     countries = [c for c in all_countries() if not args.country or c.id in args.country]
-    published = []
+    deadline = time.time() + args.max_minutes * 60 if args.max_minutes else None
+    published, incomplete = [], False
     for country in countries:
         try:
-            info = run_country(country, args.out, state, mirror, only, client, args.refresh)
+            info = run_country(country, args.out, state, mirror, only, client, args.refresh, deadline)
+        except OutOfTime:
+            log.warning("Time budget reached; progress saved, the next run resumes.")
+            incomplete = True
+            break
         except (AipError, requests.RequestException) as e:
             # One country's outage mustn't stop the others; its previous
             # publication stays in place.
@@ -373,8 +462,13 @@ def main(argv=None):
         published.append(country)
         # Written last: apps only see an edition once all its files exist.
         write_json(args.out / "v1" / country.id / "editions.json", {"schema": SCHEMA, **info})
-    write_json(args.out / "v1" / "countries.json", {"schema": SCHEMA, "countries": [c.to_json() for c in all_countries()]})
-    write_json(args.out / "v1" / "state.json", {**state.to_json(), "generatedAt": datetime.now(timezone.utc).isoformat()})
+    save_state(state, args.out)
+    if isinstance(Output.publisher, R2Publisher):
+        log.info("Published %d files to R2", Output.publisher.uploaded)
+    if incomplete:
+        # Tells the workflow to queue a follow-on run.
+        (args.out / ".incomplete").write_text("resume\n")
+        return 0
     return 0 if len(published) == len(countries) else 1
 
 

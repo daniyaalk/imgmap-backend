@@ -3,6 +3,7 @@ ATS routes. Ported from the app (lib/src/aip/, lib/src/enroute/)."""
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -15,6 +16,7 @@ import requests
 from .geo import LatLng
 
 USER_AGENT = "ImgMap-backend/1.0 (chart cache; once per AIRAC cycle)"
+log = logging.getLogger("eaip")
 
 
 class AipError(Exception):
@@ -51,6 +53,8 @@ class PoliteClient:
                     if r.status_code == 404:
                         raise err
                 time.sleep(self._pause)
+            # Visible in the run log: throttling or blocking shows up here.
+            log.warning("Retrying (attempt %d of 4): %s", attempt + 2, err)
             time.sleep(2**attempt)
         raise err
 
