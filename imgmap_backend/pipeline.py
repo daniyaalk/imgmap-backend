@@ -1,0 +1,382 @@
+"""Builds the static dataset apps read: chart lists with georeferencing,
+mirrored PDFs, and en-route networks.
+
+    python -m imgmap_backend.pipeline --out out/ [--country in-aai]
+        [--only VIDP,VOBL] [--previous https://cdn.example/ | out/]
+
+Reads each eAIP at most once per AIRAC cycle. A chart is downloaded only
+when it may have changed (HEAD fingerprint differs) and georeferenced
+again only when its PDF changed or ALGORITHM_VERSION was bumped; PDFs
+needed for re-georeferencing come from our own mirror, not the eAIP.
+
+Output (see README for the format and its compatibility rules):
+    v1/countries.json
+    v1/<country>/editions.json
+    v1/<country>/<edition>/aerodromes.json
+    v1/<country>/<edition>/ad/<ICAO>.json
+    v1/<country>/<edition>/enroute.json
+    v1/state.json              (pipeline state for the next run)
+    pdf/<sha256>.pdf
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin
+
+import requests
+
+from . import georef as gr
+from .countries import Country, all_countries
+from .eaip import MAP_CATEGORIES, AipError, ChartRef, Edition, EaipSource, PoliteClient, parse_route_page
+from .geo import Georeference
+from .pdfpage import extract_page
+
+SCHEMA = 1
+log = logging.getLogger("pipeline")
+
+
+# --- State between runs ----------------------------------------------------
+
+
+class State:
+    """What earlier runs learned, so unchanged charts aren't fetched or
+    recomputed. Published as v1/state.json beside the data."""
+
+    def __init__(self, data: dict | None = None):
+        data = data or {}
+        # sha256 -> {"algorithm", "revision", "result": {...}}
+        self.charts: dict = data.get("charts", {})
+        # "<country>|<icao>|<file>" -> {"fingerprint", "sha256", "bytes"}
+        self.files: dict = data.get("files", {})
+        # "<country>|<edition>" -> algorithm version it was fully published with
+        self.editions: dict = data.get("editions", {})
+
+    def to_json(self):
+        return {
+            "schema": SCHEMA,
+            "algorithm": gr.ALGORITHM_VERSION,
+            "charts": self.charts,
+            "files": self.files,
+            "editions": self.editions,
+        }
+
+
+def load_state(previous: str | None, out: Path) -> tuple[State, str | None]:
+    """State from a previous publication (URL or directory). Returns the
+    state and, for URLs, the base to fetch mirrored PDFs from."""
+    if previous is None:
+        local = out / "v1" / "state.json"
+        return (State(json.loads(local.read_text())) if local.exists() else State()), None
+    if previous.startswith(("http://", "https://")):
+        base = previous if previous.endswith("/") else previous + "/"
+        try:
+            r = requests.get(urljoin(base, "v1/state.json"), timeout=60)
+            if r.status_code == 200:
+                return State(r.json()), base
+            log.warning("No previous state at %s (%s); starting fresh", base, r.status_code)
+        except requests.RequestException as e:
+            log.warning("Could not read previous state: %s", e)
+        return State(), base
+    path = Path(previous) / "v1" / "state.json"
+    return (State(json.loads(path.read_text())) if path.exists() else State()), None
+
+
+# --- Charts ----------------------------------------------------------------
+
+
+def chart_entry(chart: ChartRef, pdf: dict | None, page: dict | None, result: dict) -> dict:
+    entry = {"file": chart.file_name, "title": chart.title, "category": chart.category}
+    if pdf:
+        entry["pdf"] = pdf
+    if page:
+        entry["page"] = page
+    entry.update(result)
+    return entry
+
+
+def georeference_pdf(data: bytes, points) -> tuple[dict, dict]:
+    """(page info, result) where result is {"georef": {...}} or
+    {"unusable": reason}. Positions are fractions of the displayed page."""
+    page = extract_page(data)
+    info = {
+        "width": round(page.width * page.points_per_pixel, 2),
+        "height": round(page.height * page.points_per_pixel, 2),
+        "rotation": page.rotation,
+    }
+    r = gr.auto_georeference(page, points)
+    if isinstance(r, gr.Failure):
+        return info, {"unusable": r.reason}
+    geo = Georeference.fit(r.points, r.projection, conformal=r.conformal)
+    corners = [(0, 0), (page.width, 0), (page.width, page.height), (0, page.height)]
+    footprint = [geo.to_latlng(x, y) for x, y in corners]
+    return info, {
+        "georef": {
+            "algorithm": gr.ALGORITHM_VERSION,
+            "method": r.method,
+            "projection": r.projection.id,
+            "conformal": r.conformal,
+            "accuracyM": round(r.rms_m, 1),
+            "estimated": r.estimated,
+            "points": [
+                {"u": round(p.x / page.width, 6), "v": round(p.y / page.height, 6), "lat": round(p.pos.lat, 7), "lon": round(p.pos.lon, 7)}
+                for p in r.points
+            ],
+            "footprint": [[round(c.lat, 6), round(c.lon, 6)] for c in footprint],
+            "notToScale": [
+                [round(b.left / page.width, 5), round(b.top / page.height, 5), round(b.right / page.width, 5), round(b.bottom / page.height, 5)]
+                for b in r.not_to_scale
+            ],
+        }
+    }
+
+
+class ChartProcessor:
+    def __init__(self, source: EaipSource, state: State, out: Path, mirror: str | None):
+        self.source = source
+        self.state = state
+        self.out = out
+        self.mirror = mirror
+        self.stats = {"downloaded": 0, "reused": 0, "georeferenced": 0, "usable": 0, "charts": 0}
+
+    def _fingerprint(self, chart: ChartRef) -> str | None:
+        """Size and modification time from a HEAD request: a cheap way to
+        tell an unchanged file without downloading it."""
+        try:
+            r = self.source.client.session.head(chart.url, timeout=60, allow_redirects=True)
+            self.source.client.requests += 1
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        length, modified = r.headers.get("Content-Length"), r.headers.get("Last-Modified")
+        return f"{length}|{modified}" if length and modified else None
+
+    def _pdf_bytes(self, sha: str, chart: ChartRef) -> bytes:
+        """A PDF we already know, from our own copy where possible."""
+        local = self.out / "pdf" / f"{sha}.pdf"
+        if local.exists():
+            return local.read_bytes()
+        if self.mirror:
+            r = requests.get(urljoin(self.mirror, f"pdf/{sha}.pdf"), timeout=120)
+            if r.status_code == 200 and hashlib.sha256(r.content).hexdigest() == sha:
+                return r.content
+        return self.source.download(chart)
+
+    def process(self, chart: ChartRef, points) -> dict:
+        self.stats["charts"] += 1
+        if chart.category not in MAP_CATEGORIES:
+            return chart_entry(chart, None, None, {"unusable": "Table, not a map."})
+        key = f"{self.source.country.id}|{chart.icao}|{chart.file_name}"
+        known = self.state.files.get(key)
+        fingerprint = self._fingerprint(chart)
+        data = None
+        if known and fingerprint and known.get("fingerprint") == fingerprint:
+            sha, size = known["sha256"], known["bytes"]
+            self.stats["reused"] += 1
+        else:
+            data = self.source.download(chart)
+            self.stats["downloaded"] += 1
+            sha, size = hashlib.sha256(data).hexdigest(), len(data)
+            self.state.files[key] = {"fingerprint": fingerprint, "sha256": sha, "bytes": size}
+        pdf_path = self.out / "pdf" / f"{sha}.pdf"
+        if data is not None and not pdf_path.exists():
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            pdf_path.write_bytes(data)
+
+        cached = self.state.charts.get(sha)
+        if cached and cached.get("algorithm") == gr.ALGORITHM_VERSION:
+            page, result = cached["page"], cached["result"]
+        else:
+            if data is None:
+                data = self._pdf_bytes(sha, chart)
+                if not pdf_path.exists():
+                    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                    pdf_path.write_bytes(data)
+            page, result = georeference_pdf(data, points)
+            self.stats["georeferenced"] += 1
+            # A revision counter apps compare to know their copy is stale.
+            revision = (cached or {}).get("revision", 0)
+            if cached is None or cached.get("result") != result:
+                revision += 1
+            self.state.charts[sha] = {"algorithm": gr.ALGORITHM_VERSION, "revision": revision, "page": page, "result": result}
+        result = dict(result)
+        if "georef" in result:
+            result["georef"] = {"revision": self.state.charts[sha]["revision"], **result["georef"]}
+            self.stats["usable"] += 1
+        return chart_entry(chart, {"path": f"pdf/{sha}.pdf", "sha256": sha, "bytes": size}, page, result)
+
+
+# --- En-route --------------------------------------------------------------
+
+
+def build_enroute(source: EaipSource, edition: Edition) -> dict:
+    """The airway network, in the app's EnrouteData JSON format."""
+    pages = source.route_pages(edition)
+    parsed, unread = [], []
+    with ThreadPoolExecutor(2) as pool:
+        def fetch(name):
+            try:
+                return parse_route_page(source.page(edition, name)), None
+            except Exception as e:  # noqa: BLE001 - recorded, not fatal
+                log.warning("Route page %s: %s", name, e)
+                return [], name
+
+        for routes, failed in pool.map(fetch, pages):
+            parsed.extend(routes)
+            if failed:
+                unread.append(failed)
+
+    points, index = [], {}
+
+    def point(p):
+        name, ident, pos, kind, compulsory = p
+        key = f"{ident or name}|{pos.lat:.4f}|{pos.lon:.4f}"
+        if key in index:
+            i = index[key]
+            if compulsory and not points[i].get("c"):
+                points[i]["c"] = True
+            return i
+        entry = {"n": name, "lat": pos.lat, "lon": pos.lon, "k": kind}
+        if ident:
+            entry["i"] = ident
+        if compulsory:
+            entry["c"] = True
+        index[key] = len(points)
+        points.append(entry)
+        return index[key]
+
+    routes = []
+    for r in parsed:
+        ids = [point(p) for p in r.points]
+        segs = []
+        for i in range(len(ids) - 1):
+            seg = {"f": ids[i], "t": ids[i + 1]}
+            leg = r.legs[i] if i < len(r.legs) else {}
+            seg.update({k: v for k, v in leg.items() if v is not None})
+            segs.append(seg)
+        route = {"id": r.designator, "seg": segs}
+        if r.navigation_spec:
+            route["spec"] = r.navigation_spec
+        routes.append(route)
+    return {
+        "version": 1,
+        "source": source.country.id,
+        "edition": edition.id,
+        "editionName": edition.name,
+        "points": points,
+        "routes": routes,
+        "unread": unread,
+    }
+
+
+# --- Run -------------------------------------------------------------------
+
+
+def write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+    tmp.replace(path)
+
+
+def editions_to_publish(source: EaipSource) -> list[Edition]:
+    """The edition in force and any announced after it."""
+    editions = source.editions()
+    today = date.today().isoformat()
+    current = [e for e in editions if e.effective <= today]
+    keep = [e for e in editions if e.effective > today]
+    if current:
+        keep.append(max(current, key=lambda e: e.effective))
+    return sorted(keep, key=lambda e: e.effective)
+
+
+def run_country(country: Country, out: Path, state: State, mirror, only, client, refresh=False) -> dict:
+    source = EaipSource(country, client)
+    editions = editions_to_publish(source)
+    log.info("%s: editions %s", country.country, [e.name for e in editions])
+    processor = ChartProcessor(source, state, out, mirror)
+    for edition in editions:
+        done_key = f"{country.id}|{edition.id}"
+        # A published edition doesn't change; skip it unless the algorithm
+        # improved (or a refresh is forced), keeping daily runs to one request.
+        if not only and not refresh and state.editions.get(done_key) == gr.ALGORITHM_VERSION:
+            log.info("%s %s: already published", country.country, edition.name)
+            continue
+        base = out / "v1" / country.id / edition.id
+        aerodromes = source.aerodromes(edition)
+        if only:
+            aerodromes = [a for a in aerodromes if a in only]
+        summary = []
+        for icao in aerodromes:
+            started = time.time()
+            charts = source.charts(icao, edition)
+            points = source.points(icao, edition) if charts else None
+            entries = []
+            with ThreadPoolExecutor(2) as pool:
+                for entry in pool.map(lambda c: _safe(processor, c, points), charts):
+                    entries.append(entry)
+            write_json(base / "ad" / f"{icao}.json", {"schema": SCHEMA, "icao": icao, "edition": edition.id, "charts": entries})
+            usable = sum(1 for e in entries if "georef" in e)
+            summary.append({"icao": icao, "charts": len(entries), "usable": usable})
+            log.info("%s %s: %d charts, %d usable (%.0fs)", edition.name, icao, len(entries), usable, time.time() - started)
+        write_json(base / "aerodromes.json", {"schema": SCHEMA, "aerodromes": summary})
+        enroute = build_enroute(source, edition)
+        write_json(base / "enroute.json", enroute)
+        log.info("%s en-route: %d routes, %d points", edition.name, len(enroute["routes"]), len(enroute["points"]))
+        if not only:
+            state.editions[done_key] = gr.ALGORITHM_VERSION
+    log.info("%s: %s; %d eAIP requests", country.country, processor.stats, client.requests)
+    return {"editions": [{"id": e.id, "name": e.name, "effective": e.effective} for e in editions]}
+
+
+def _safe(processor: ChartProcessor, chart: ChartRef, points) -> dict:
+    try:
+        return processor.process(chart, points)
+    except (AipError, requests.RequestException, ValueError) as e:
+        log.warning("%s %s: %s", chart.icao, chart.file_name, e)
+        return chart_entry(chart, None, None, {"unusable": f"Could not process: {e}"})
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--country", action="append", help="country id(s); default all")
+    ap.add_argument("--only", help="comma-separated ICAO codes (for testing)")
+    ap.add_argument("--previous", help="URL or directory of the last publication")
+    ap.add_argument("--contact", help="contact address sent to eAIP servers")
+    ap.add_argument("--refresh", action="store_true", help="recheck published editions for changed files")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+
+    state, mirror = load_state(args.previous, args.out)
+    client = PoliteClient(contact=args.contact)
+    only = set(args.only.split(",")) if args.only else None
+    countries = [c for c in all_countries() if not args.country or c.id in args.country]
+    published = []
+    for country in countries:
+        try:
+            info = run_country(country, args.out, state, mirror, only, client, args.refresh)
+        except (AipError, requests.RequestException) as e:
+            # One country's outage mustn't stop the others; its previous
+            # publication stays in place.
+            log.error("%s failed: %s", country.country, e)
+            continue
+        published.append(country)
+        # Written last: apps only see an edition once all its files exist.
+        write_json(args.out / "v1" / country.id / "editions.json", {"schema": SCHEMA, **info})
+    write_json(args.out / "v1" / "countries.json", {"schema": SCHEMA, "countries": [c.to_json() for c in all_countries()]})
+    write_json(args.out / "v1" / "state.json", {**state.to_json(), "generatedAt": datetime.now(timezone.utc).isoformat()})
+    return 0 if len(published) == len(countries) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

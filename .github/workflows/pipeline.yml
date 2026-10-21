@@ -1,0 +1,74 @@
+# Builds the dataset and publishes it to Cloudflare R2.
+#
+# Runs daily; a run only reaches the eAIPs for new editions (or after
+# ALGORITHM_VERSION is bumped), so most days it is a single request.
+#
+# Repository settings needed (see README):
+#   secrets  R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+#   vars     R2_ACCOUNT_ID, R2_BUCKET, PUBLIC_BASE_URL, CONTACT
+name: pipeline
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      refresh:
+        description: Recheck published editions for changed files
+        type: boolean
+        default: false
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Tests
+        run: python -m pytest -q tests
+
+      - name: Build
+        run: >
+          python -m imgmap_backend.pipeline
+          --out out
+          --previous "${{ vars.PUBLIC_BASE_URL }}"
+          --contact "${{ vars.CONTACT }}"
+          ${{ inputs.refresh && '--refresh' || '' }}
+
+      - name: Install rclone
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+
+      - name: Publish
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          # PDFs are content-addressed: never change, cache forever.
+          if [ -d out/pdf ]; then
+            rclone copy out/pdf "r2:$BUCKET/pdf" --immutable --transfers 8 \
+              --header-upload "Cache-Control: public, max-age=31536000, immutable" \
+              --header-upload "Content-Type: application/pdf"
+          fi
+          # Data next; the edition lists that point at it go last, so apps
+          # never see an edition whose files aren't all there yet.
+          JSON=(--header-upload "Cache-Control: public, max-age=300" --header-upload "Content-Type: application/json")
+          rclone copy out/v1 "r2:$BUCKET/v1" --exclude "*/editions.json" --exclude "countries.json" "${JSON[@]}"
+          rclone copy out/v1 "r2:$BUCKET/v1" --include "*/editions.json" --include "countries.json" "${JSON[@]}"
