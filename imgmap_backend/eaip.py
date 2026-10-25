@@ -3,13 +3,17 @@ ATS routes. Ported from the app (lib/src/aip/, lib/src/enroute/)."""
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote, unquote, urljoin
 
+import certifi
 import lxml.html
 import requests
 
@@ -25,6 +29,16 @@ class AipError(Exception):
         self.status = status
 
 
+@functools.cache
+def ca_bundle() -> str:
+    """certifi's roots plus the intermediates some eAIP servers don't send
+    (intermediates.pem), as a file for requests' verify."""
+    pem = Path(certifi.where()).read_text() + (Path(__file__).parent / "intermediates.pem").read_text()
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", prefix="imgmap-ca-", delete=False) as f:
+        f.write(pem)
+    return f.name
+
+
 class PoliteClient:
     """HTTP for a public service we must not burden: few requests at a time,
     a pause between them, and retries with backoff."""
@@ -33,6 +47,7 @@ class PoliteClient:
         self.session = requests.Session()
         ua = USER_AGENT + (f"; {contact}" if contact else "")
         self.session.headers["User-Agent"] = ua
+        self.session.verify = ca_bundle()
         self._slots = threading.Semaphore(max_parallel)
         self._pause = pause
         self.requests = 0
