@@ -33,7 +33,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 | `v1/<country>/editions.json` | The edition in force and any announced: `id`, `name`, `effective` |
 | `v1/<country>/<edition>/aerodromes.json` | Aerodromes with chart counts |
 | `v1/<country>/<edition>/ad/<ICAO>.json` | The aerodrome's charts (below) |
-| `v1/<country>/<edition>/enroute.json` | The airway network (the app's `EnrouteData` format) |
+| `v1/<country>/<edition>/enroute.json` | The airway network and airspace (the app's `EnrouteData` format; below) |
 | `v1/state.json` | Pipeline state, read by the next run |
 | `pdf/<sha256>.pdf` | Mirrored charts, content-addressed and immutable |
 
@@ -55,6 +55,24 @@ A chart entry:
 ```
 
 Charts that can't be georeferenced have `"unusable": "<reason>"` and no `georef`.
+
+`enroute.json` lists, beside the routes, the airspace from ENR 2.1 (FIRs, control areas, TMAs and control zones) with the units serving it:
+
+```json
+{
+  "n": "Delhi- LDP1 (Lower Delhi ACC North East)", "k": "cta",
+  "rings": [[[28.5669, 77.0936], [27.3356, 77.9531], [26.5869, 79.0411]]],
+  "approx": true,
+  "u": "FL 255", "uft": 25500, "l": "FL 155", "lft": 15500, "cls": "D",
+  "units": [{"n": "Delhi ACC", "cs": "Delhi Control/Delhi Radar (RSR)", "h": "H24", "f": [120900, 134500]}]
+}
+```
+
+- `k` is `fir`, `cta`, `tma` or `ctr`.
+- `rings` are `[lat, lon]` polygons, arcs and circles already drawn as points: the outer boundary, then any holes. Absent when the limits can't be read (no coordinates published).
+- `approx` marks a boundary partly following a border or coastline, or a misprinted arc, drawn as a straight line.
+- `uft`/`lft` are the limits in feet (flight levels as hundreds of feet); `uft` is absent for `UNL`.
+- `f` are frequencies in kHz (VHF `120900` = 120.900 MHz, HF `10018`).
 
 - `u`, `v` are positions as **fractions of the displayed page** (after rotation), so they don't depend on the size an app renders the PDF at.
 - The app fits the points in `projection` (`merc` or `utm<zone><n|s>`), with scale and rotation only when `conformal` is true.

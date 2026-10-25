@@ -35,6 +35,7 @@ from urllib.parse import urljoin
 import requests
 
 from . import georef as gr
+from .airspace import parse_airspace_page
 from .countries import Country, all_countries
 from .eaip import MAP_CATEGORIES, AipError, ChartRef, Edition, EaipSource, PoliteClient, parse_route_page
 from .geo import Georeference
@@ -42,6 +43,9 @@ from .pdfpage import extract_page
 from .publish import Publisher, R2Publisher
 
 SCHEMA = 1
+# Bumped when enroute.json gains data (2: airspace); published editions get
+# a new one without their charts being rechecked.
+ENROUTE_VERSION = 2
 log = logging.getLogger("pipeline")
 
 
@@ -63,6 +67,8 @@ class State:
         # "<country>|<edition>" -> {icao: summary} for an edition still being
         # built: a run that runs out of time resumes from here.
         self.progress: dict = data.get("progress", {})
+        # "<country>|<edition>" -> ENROUTE_VERSION of its published enroute.json
+        self.enroute: dict = data.get("enroute", {})
 
     def to_json(self):
         return {
@@ -72,6 +78,7 @@ class State:
             "files": self.files,
             "editions": self.editions,
             "progress": self.progress,
+            "enroute": self.enroute,
         }
 
 
@@ -278,6 +285,13 @@ def build_enroute(source: EaipSource, edition: Edition) -> dict:
         if r.navigation_spec:
             route["spec"] = r.navigation_spec
         routes.append(route)
+    airspace_page = source.section_page("ENR 2.1")
+    try:
+        airspaces = parse_airspace_page(source.page(edition, airspace_page))
+    except Exception as e:  # noqa: BLE001 - recorded, not fatal
+        log.warning("Airspace page %s: %s", airspace_page, e)
+        airspaces = []
+        unread.append(airspace_page)
     return {
         "version": 1,
         "source": source.country.id,
@@ -285,6 +299,7 @@ def build_enroute(source: EaipSource, edition: Edition) -> dict:
         "editionName": edition.name,
         "points": points,
         "routes": routes,
+        "airspaces": airspaces,
         "unread": unread,
     }
 
@@ -367,7 +382,11 @@ def run_country(country: Country, out: Path, state: State, mirror, only, client,
             # A published edition doesn't change; skip it unless the algorithm
             # improved (or a refresh is forced), keeping daily runs to one request.
             if not only and not refresh and state.editions.get(done_key) == gr.ALGORITHM_VERSION:
-                log.info("%s %s: already published", country.country, edition.name)
+                if state.enroute.get(done_key) != ENROUTE_VERSION:
+                    publish_enroute(source, edition, out)
+                    state.enroute[done_key] = ENROUTE_VERSION
+                else:
+                    log.info("%s %s: already published", country.country, edition.name)
                 continue
             base = out / "v1" / country.id / edition.id
             aerodromes = source.aerodromes(edition)
@@ -404,16 +423,24 @@ def run_country(country: Country, out: Path, state: State, mirror, only, client,
             check_time()
             summary = [done[a] for a in aerodromes if a in done]
             write_json(base / "aerodromes.json", {"schema": SCHEMA, "aerodromes": summary})
-            enroute = build_enroute(source, edition)
-            write_json(base / "enroute.json", enroute)
-            log.info("%s en-route: %d routes, %d points", edition.name, len(enroute["routes"]), len(enroute["points"]))
+            publish_enroute(source, edition, out)
             built.append(edition.id)
             if not only:
                 state.editions[done_key] = gr.ALGORITHM_VERSION
+                state.enroute[done_key] = ENROUTE_VERSION
                 state.progress.pop(done_key, None)
     finally:
         log.info("%s: %s; %d eAIP requests", country.country, processor.stats, client.requests)
     return listing()
+
+
+def publish_enroute(source: EaipSource, edition: Edition, out: Path):
+    enroute = build_enroute(source, edition)
+    write_json(out / "v1" / source.country.id / edition.id / "enroute.json", enroute)
+    log.info(
+        "%s en-route: %d routes, %d points, %d airspaces",
+        edition.name, len(enroute["routes"]), len(enroute["points"]), len(enroute["airspaces"]),
+    )
 
 
 def _safe(processor: ChartProcessor, chart: ChartRef, points) -> dict:

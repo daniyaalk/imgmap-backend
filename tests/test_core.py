@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from imgmap_backend import georef as gr
+from imgmap_backend.airspace import arc, frequencies_khz, level_ft, parse_airspace_page
 from imgmap_backend.countries.india import describe_chart, parse_editions
 from imgmap_backend.eaip import PointDirectory, node_text, parse_html, parse_point_page, parse_route_page
 from imgmap_backend.geo import WEB_MERCATOR, ControlPoint, Georeference, LatLng, TransverseMercator
@@ -132,6 +133,72 @@ def test_india_editions_and_charts():
     assert describe_chart("VOBL", "VOBL-SID-RWY-09L-RNAV1-GNSS-RWY 09L-RNAV1 (GNSS)-  ANIRO 8A-Table 1.pdf")[1] == "tabular"
     assert describe_chart("VOBL", "VOBL-SID-RWY-27L-RNAV1-GNSS-WAYPOINTS.pdf")[1] == "tabular"
     assert describe_chart("VIDP", "VIDP-ILS-LOC-RWY-27.pdf") == ("ILS LOC RWY 27", "approach")
+
+
+def airspace_page(section, rows):
+    """An ENR 2.1 page: a section heading, then airspaces, each a list of
+    units (unit, call sign, frequencies)."""
+    out = f"<html><body><table><tr><td>{section}</td></tr></table><table>"
+    out += "<tr><td>Name, Lateral Limits Vertical Limits Class of airspace</td><td>Unit providing service</td>"
+    out += "<td>Call sign Languages Hours of service</td><td>Frequency/Purpose</td><td>Remarks</td></tr>"
+    for cell, units in rows:
+        for i, (unit, callsign, freqs) in enumerate(units):
+            first = f"<td rowspan='{len(units)}'>{cell}</td>" if i == 0 else ""
+            out += f"<tr>{first}<td>{unit}</td><td>{callsign}</td><td>{freqs}</td><td></td></tr>"
+    return out + "</table></body></html>"
+
+
+def test_airspace_page():
+    page = airspace_page("2.1.2 Control Area", [
+        ("<p><em class='Bold'>Udaipur Control Area-</em></p><p>Area bounded by circular area of radius 30 NM "
+         "centred on 243706N 0735334E.</p><p>FL 145 / 2700FT AMSL</p><p>D</p>",
+         [("Udaipur Approach", "Udaipur Approach English HO", "120.85 MHZ")]),
+        ("<p><em class='Bold'>Delhi- LDP1</em></p><p>Area bounded by - 283401N 0770537E; 272008N 0775711E; "
+         "263513N 790228E; then Westward along the International Boundary of India with Nepal "
+         "to 300550N 0783633E; 283401N 0770537E</p><p>FL 255 / 155FT AMSL</p><p>D</p>",
+         [("Delhi ACC", "Delhi Control/Delhi Radar (RSR) English H24",
+           "<del>120.5 MHZ</del><ins>120.9 MHZ</ins> 134.5 MHZ"),
+          ("Delhi Radio", "Delhi Radio English H24", "10018 KHZ 3467 KHZ")]),
+        ("<p><em class='Bold'>Goa Control Area- 6</em></p><p>Area bounded by lines joining points 160557N 0730501E; "
+         "161504N 0724458E; 163534N 0730628E then along the counter clockwise arc of a circle of 150NM radius "
+         "centred on 190530N 0725158E to 165308N 0740713E; 162028N 0742844E then along the counter clockwise arc "
+         "of a circle of 50NM radius centred on 154433N 0735201E to point of origin.</p><p>FL 195 / FL 85</p><p>D</p>",
+         [("MOPA APP", "Mopa Approach English H24", "123.8 MHZ 125 MHZ")]),
+    ])
+    udaipur, delhi, goa = parse_airspace_page(page)
+    assert udaipur["n"] == "Udaipur Control Area" and udaipur["k"] == "cta"
+    assert (udaipur["u"], udaipur["uft"], udaipur["l"], udaipur["lft"], udaipur["cls"]) == ("FL 145", 14500, "2700 FT AMSL", 2700, "D")
+    ring = [LatLng(*p) for p in udaipur["rings"][0]]
+    centre = LatLng(24 + 37 / 60 + 6 / 3600, 73 + 53 / 60 + 34 / 3600)
+    assert all(c.distance_to(centre) == pytest.approx(30 * 1852, rel=0.01) for c in ring)
+    assert udaipur["units"] == [{"n": "Udaipur Approach", "f": [120850], "cs": "Udaipur Approach", "h": "HO"}]
+
+    # Along a border: drawn straight, and said to be approximate. The
+    # longitude missing its leading zero still reads.
+    assert delhi["approx"] and len(delhi["rings"][0]) == 4
+    assert delhi["rings"][0][2] == [26.5869, 79.0411]
+    assert delhi["l"] == "FL 155" and delhi["lft"] == 15500  # a misprint, corrected
+    assert [u["f"] for u in delhi["units"]] == [[120900, 134500], [10018, 3467]]
+    assert delhi["units"][0]["cs"] == "Delhi Control/Delhi Radar (RSR)"
+
+    # Two arcs, the second closing the area.
+    assert "approx" not in goa and len(goa["rings"][0]) > 10
+    assert (goa["l"], goa["lft"]) == ("FL 085", 8500)
+    assert goa["units"][0]["f"] == [123800, 125000]
+
+
+def test_airspace_helpers():
+    assert level_ft("FL 075") == 7500 and level_ft("UNL") is None and level_ft("GND") == 0
+    assert level_ft("4 000 ft AMSL") == 4000
+    assert frequencies_khz("124.45 124.5 MHZ 126.15 MHZ5670 KHZ 128.3 OTHER 3023 KHZ") == [124450, 124500, 126150, 5670, 128300, 3023]
+    c = LatLng(19.0, 73.0)
+    start = LatLng(19.5, 73.0)  # 30 NM north
+    end = LatLng(19.0, 73.0 + 0.5 / math.cos(math.radians(19)))  # ~30 NM east
+    cw = arc(start, end, c, 30, clockwise=True)
+    ccw = arc(start, end, c, 30, clockwise=False)
+    assert len(ccw) > 2 * len(cw)  # the long way round
+    assert all(p.lon > 73 for p in cw)
+    assert arc(start, LatLng(19.0, 74.5), c, 30, clockwise=True) is None  # end not on the circle
 
 
 # --- Georeferencing on synthetic charts --------------------------------------

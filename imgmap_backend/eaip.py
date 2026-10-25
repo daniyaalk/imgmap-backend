@@ -387,7 +387,8 @@ class EaipSource:
     def page(self, edition: Edition, name: str) -> str:
         return self.client.text(self.page_url(edition, name))
 
-    def _section(self, section: str) -> str:
+    def section_page(self, section: str) -> str:
+        """The page name of an AIP section, e.g. ENR 2.1."""
         return f"{self.country.page_prefix}{section}-{self.country.language}.html"
 
     def aerodromes(self, edition: Edition) -> list[str]:
@@ -429,11 +430,11 @@ class EaipSource:
         if edition.id not in self._shared_points:
             shared = PointDirectory()
             for section in ("ENR 4.4", "ENR 4.1"):
-                shared.merge(self._points_page(edition, self._section(section)))
+                shared.merge(self._points_page(edition, self.section_page(section)))
             self._shared_points[edition.id] = shared
         result = PointDirectory()
         result.merge(self._shared_points[edition.id])
-        result.merge(self._points_page(edition, self._section(f"AD 2.1{icao}")))
+        result.merge(self._points_page(edition, self.section_page(f"AD 2.1{icao}")))
         return result
 
     def _points_page(self, edition, name) -> PointDirectory:
