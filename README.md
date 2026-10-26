@@ -139,6 +139,18 @@ The pipeline only needs Python and writes a directory. Serve `out/` with any web
 
 Without `--previous`, state is read from the output directory.
 
+## Flight replay website (`site/`)
+
+`site/replay/` is a static page, published at `/replay/` beside the data: upload a KML or KMZ track (FlightAware, ForeFlight, Flightradar24, Google Earth) and watch the aircraft move on any georeferenced chart, with an altitude profile. It finds the charts the flight crosses from their footprints, using the AIP edition in force on the flight's date. The file never leaves the browser.
+
+It reads `/v1/` and `/pdf/` from its own origin, so the bucket needs no CORS rules. The positioning math (`geo.js`) is a port of the app's and is tested against the footprints the pipeline publishes.
+
+```sh
+node --test tests/site/*.test.mjs
+.venv/bin/python -m imgmap_backend.site serve      # http://localhost:8770/replay/, data from the live site
+.venv/bin/python -m imgmap_backend.site publish    # what .github/workflows/site.yml runs on each push to site/
+```
+
 ## Costs and upkeep
 - **Storage:** India is roughly 3 GB of PDFs. Charts unchanged between editions are stored once, so growth per cycle is small.
 - **Compute:** a full first run is one to two hours of Actions time; a normal daily run takes seconds.

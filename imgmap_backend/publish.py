@@ -19,7 +19,7 @@ _STATE_HEADERS = {"ContentType": "application/json", "CacheControl": "no-store"}
 class Publisher:
     """Keeps results in the output directory only (e.g. a VPS serving it)."""
 
-    def put(self, key: str, data: bytes):
+    def put(self, key: str, data: bytes, headers: dict | None = None):
         pass
 
     def get(self, key: str) -> bytes | None:
@@ -58,13 +58,14 @@ class R2Publisher(Publisher):
         except KeyError as e:
             raise SystemExit(f"--publish-r2 needs the environment variable {e}") from None
 
-    def put(self, key: str, data: bytes):
-        if key.endswith(".pdf"):
-            headers = _PDF_HEADERS
-        elif key.endswith("state.json"):
-            headers = _STATE_HEADERS
-        else:
-            headers = _JSON_HEADERS
+    def put(self, key: str, data: bytes, headers: dict | None = None):
+        if headers is None:
+            if key.endswith(".pdf"):
+                headers = _PDF_HEADERS
+            elif key.endswith("state.json"):
+                headers = _STATE_HEADERS
+            else:
+                headers = _JSON_HEADERS
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data, **headers)
         with self._lock:
             self.uploaded += 1
