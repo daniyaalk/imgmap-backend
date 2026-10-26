@@ -36,6 +36,18 @@ def files() -> dict[str, Path]:
     return out
 
 
+def redirects() -> dict[str, bytes]:
+    """"replay" → "replay/": the bucket can't redirect, so a page does."""
+    return {
+        key[:-1]: (
+            f'<!doctype html><meta charset="utf-8"><title>Redirecting</title>'
+            f'<meta http-equiv="refresh" content="0; url=/{key}"><a href="/{key}">/{key}</a>'
+        ).encode()
+        for key in files()
+        if key.endswith("/")
+    }
+
+
 def content_type(path: Path) -> str:
     return _TYPES.get(path.suffix) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
@@ -44,6 +56,9 @@ def publish(publisher: R2Publisher):
     for key, path in files().items():
         publisher.put(key, path.read_bytes(), {"ContentType": content_type(path), "CacheControl": _CACHE})
         print(f"published {key}")
+    for key, page in redirects().items():
+        publisher.put(key, page, {"ContentType": "text/html; charset=utf-8", "CacheControl": _CACHE})
+        print(f"published {key} (redirect)")
 
 
 def serve(port: int, upstream: str):
