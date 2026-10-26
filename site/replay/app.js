@@ -42,7 +42,7 @@ const S = {
   country: null,
   editions: [],
   edition: null,
-  aerodromes: [],
+  aerodromes: null, // usable ICAOs of the edition; null while loading
   ad: new Map(), // "<edition>/<ICAO>" → promise of the aerodrome's JSON
   chart: null, // {icao, ...chart entry}
   page: null,
@@ -142,8 +142,18 @@ function flightDate() {
 
 async function chooseEdition(edition) {
   S.edition = edition;
+  S.aerodromes = null; // loading; searches wait for chooseEdition to rerun them
   $("edition").value = edition.id;
-  const { aerodromes } = await fetchJson(`v1/${S.country.id}/${edition.id}/aerodromes.json`);
+  showCharts();
+  let aerodromes;
+  try {
+    ({ aerodromes } = await fetchJson(`v1/${S.country.id}/${edition.id}/aerodromes.json`));
+  } catch (e) {
+    if (S.edition !== edition) return;
+    S.aerodromes = [];
+    $("charts").replaceChildren(el("p", "status error", `Couldn't load the aerodromes of ${edition.name} (${e.message}). Choose the edition again to retry.`));
+    return;
+  }
   if (S.edition !== edition) return;
   S.aerodromes = aerodromes.filter((a) => a.usable > 0).map((a) => a.icao);
   $("icaos").replaceChildren(...S.aerodromes.map((icao) => new Option(icao)));
@@ -155,7 +165,7 @@ async function chooseEdition(edition) {
 /** The aerodrome typed in the filter, if the edition has it. */
 function aerodromeFilter() {
   const v = $("icao").value.trim().toUpperCase();
-  return S.aerodromes.includes(v) ? v : null;
+  return S.aerodromes?.includes(v) ? v : null;
 }
 
 /** Every usable chart whose footprint the flight passes through. */
@@ -164,7 +174,7 @@ async function findCharts() {
   S.found = null;
   S.searched = 0;
   showCharts();
-  if (!S.flight) return;
+  if (!S.flight || !S.aerodromes) return; // chooseEdition searches once they're in
   const samples = sample(S.flight.points, COVERAGE_SAMPLES);
   const found = [];
   const queue = [...S.aerodromes];
@@ -199,6 +209,10 @@ async function showCharts() {
   const box = $("charts");
   const icao = aerodromeFilter();
   const status = (text, cls = "status") => el("p", cls, text);
+  if (!S.aerodromes) {
+    box.replaceChildren(status("Loading the chart list…"));
+    return;
+  }
   if (S.flight) {
     if (!S.found) {
       box.replaceChildren(status(`Looking for charts this flight crosses… ${S.searched} of ${S.aerodromes.length} aerodromes`));
@@ -726,7 +740,7 @@ function wireUi() {
   const icao = $("icao");
   icao.oninput = () => {
     const v = icao.value.trim().toUpperCase();
-    if (v.length === 4 && !S.aerodromes.includes(v)) {
+    if (v.length === 4 && S.aerodromes && !S.aerodromes.includes(v)) {
       $("charts").replaceChildren(el("p", "status", `No ${v} charts in ${S.edition?.name ?? "this edition"} can show a position.`));
     } else if (v.length === 4 || v.length === 0) {
       showCharts();
