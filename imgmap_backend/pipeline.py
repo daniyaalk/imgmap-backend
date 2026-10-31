@@ -335,14 +335,20 @@ def write_pdf(path: Path, data: bytes):
     Output.publish(path)
 
 
-def editions_to_publish(source: EaipSource) -> list[Edition]:
-    """The edition in force and any announced after it."""
+def editions_to_publish(source: EaipSource, today: str | None = None) -> list[Edition]:
+    """The edition in force and any announced after it.
+
+    A country always has an edition in force, so a page that shows none (an
+    outage, a maintenance page, a redesign) is an error, not an empty list:
+    the country is skipped and its published listing stays as it was."""
     editions = source.editions()
-    today = date.today().isoformat()
+    today = today or date.today().isoformat()
     current = [e for e in editions if e.effective <= today]
+    if not current:
+        found = ", ".join(f"{e.name} (from {e.effective})" for e in editions) or "none"
+        raise AipError(f"{source.country.country}: no edition in force on the eAIP home page (found: {found})")
     keep = [e for e in editions if e.effective > today]
-    if current:
-        keep.append(max(current, key=lambda e: e.effective))
+    keep.append(max(current, key=lambda e: e.effective))
     return sorted(keep, key=lambda e: e.effective)
 
 

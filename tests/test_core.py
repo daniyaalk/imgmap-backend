@@ -1,6 +1,7 @@
 """Tests ported from the app's Dart suite (georeference, projection,
 grid_labels, fix_matching, aip, enroute)."""
 
+import dataclasses
 import math
 
 import numpy as np
@@ -133,6 +134,34 @@ def test_india_editions_and_charts():
     assert describe_chart("VOBL", "VOBL-SID-RWY-09L-RNAV1-GNSS-RWY 09L-RNAV1 (GNSS)-  ANIRO 8A-Table 1.pdf")[1] == "tabular"
     assert describe_chart("VOBL", "VOBL-SID-RWY-27L-RNAV1-GNSS-WAYPOINTS.pdf")[1] == "tabular"
     assert describe_chart("VIDP", "VIDP-ILS-LOC-RWY-27.pdf") == ("ILS LOC RWY 27", "approach")
+
+
+def test_a_home_page_without_editions_keeps_the_published_listing(tmp_path):
+    """An eAIP home page that lists nothing in force (an outage, a
+    maintenance page, a redesign) must not replace the published editions."""
+    from imgmap_backend.countries.india import INDIA
+    from imgmap_backend.eaip import AipError, Edition
+    from imgmap_backend.pipeline import State, editions_to_publish, run_country
+
+    def source(editions):
+        class Source:
+            country = INDIA
+        Source.editions = lambda self: editions
+        return Source()
+
+    ed = lambda n, eff: Edition(id=f"2026-{n}", name=f"AMDT {n}/2026", effective=eff, base_url="https://x/")
+    listed = [ed("11", "2026-11-26"), ed("10", "2026-10-29"), ed("09", "2026-10-01")]
+    assert [e.id for e in editions_to_publish(source(listed), today="2026-10-31")] == ["2026-10", "2026-11"]
+    with pytest.raises(AipError, match="no edition in force"):
+        editions_to_publish(source([]), today="2026-10-31")
+    with pytest.raises(AipError, match=r"AMDT 11/2026 \(from 2026-11-26\)"):
+        editions_to_publish(source(listed[:1]), today="2026-10-31")
+
+    # The whole country run stops before writing anything.
+    india = dataclasses.replace(INDIA, find_editions=lambda client: [])
+    with pytest.raises(AipError):
+        run_country(india, tmp_path, State(), mirror=None, only=None, client=None)
+    assert not any(tmp_path.rglob("*"))
 
 
 def airspace_page(section, rows):
