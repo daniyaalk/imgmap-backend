@@ -1,0 +1,43 @@
+# Deploys the /live/ Worker (live flight positions for the replay page)
+# whenever it changes on main.
+#
+# Needs secrets.CLOUDFLARE_API_TOKEN (Workers Scripts: Edit, Workers
+# Routes: Edit) and vars.R2_ACCOUNT_ID (see README, "Live flights").
+name: live
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "live/**"
+      - "tests/live/**"
+      - ".github/workflows/live.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: live
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Tests
+        run: node --test tests/live/*.test.mjs
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.R2_ACCOUNT_ID }}
+          workingDirectory: live

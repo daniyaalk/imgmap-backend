@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Flight Replay · AIPChart</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='-17 -17 34 34'%3E%3Cpath d='M0 -15 L2.2 -6 L2.2 -2 L14 4 L14 7 L2.2 4 L1.8 11 L5.5 14 L5.5 16 L0 14.5 L-5.5 16 L-5.5 14 L-1.8 11 L-2.2 4 L-14 7 L-14 4 L-2.2 -2 L-2.2 -6 Z' fill='%23c2187d'/%3E%3C/svg%3E">
-<meta name="description" content="Replay a flight from a KML file on georeferenced AIP charts. Not for navigation.">
+<meta name="description" content="Replay a flight from a KML file, or follow one live, on georeferenced AIP charts. Not for navigation.">
 <style>
   :root {
     --bg: #f4f5f7;
@@ -85,6 +85,24 @@
   .note { margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: var(--warn-bg); color: var(--warn-text); font-size: 12px; }
   .error { color: #d33; }
 
+  .or { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; font-size: 12px; color: var(--muted); }
+  .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  .live-find { display: flex; gap: 6px; }
+  .live-find input { flex: 1; min-width: 0; text-transform: uppercase; }
+  .live-find input::placeholder { text-transform: none; }
+  .btn {
+    padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel);
+    cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.wide { width: 100%; margin-top: 6px; }
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e0362c; margin-right: 6px; vertical-align: 1px; animation: pulse 2s infinite; }
+  .live-dot.stale { background: var(--muted); animation: none; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+  .chart .here { color: #e0362c; }
+
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; min-width: 0; }
   select, input[type="text"] {
@@ -154,6 +172,9 @@
   .player input[type="range"] { width: 100%; accent-color: var(--accent); }
   .clock { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 74px; text-align: right; }
   .player select { width: auto; }
+  .live-tag { font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+  .player.live { grid-template-columns: auto 1fr auto; }
+  .player.live #play, .player.live #seek, .player.live #speed { display: none; }
   .follow { display: flex; gap: 6px; align-items: center; font-size: 13px; white-space: nowrap; }
   .profile { grid-column: 1 / -1; position: relative; height: 84px; }
   .profile canvas { width: 100%; height: 100%; display: block; cursor: col-resize; touch-action: none; }
@@ -175,6 +196,7 @@
     .panel { border-right: 0; border-bottom: 1px solid var(--line); }
     .viewer { height: 92vh; }
     .player { grid-template-columns: auto 1fr auto; }
+    .player.live .follow { grid-row: auto; }
     .player .follow, .player select { grid-row: 3; }
     .readouts { grid-template-columns: repeat(2, 1fr); }
   }
@@ -195,6 +217,14 @@
         <strong>Choose a KML or KMZ file</strong>
         <span>or drop it here. It stays in your browser.</span>
       </label>
+      <div class="or">or follow a live flight</div>
+      <form class="live-find" id="live-form">
+        <input type="text" id="live-q" placeholder="Callsign or registration" maxlength="10"
+               autocomplete="off" spellcheck="false" aria-label="Callsign or registration">
+        <button class="btn" type="submit">Find</button>
+      </form>
+      <button class="btn wide" id="live-near" type="button" disabled title="Open a chart first">Aircraft on this chart</button>
+      <div class="list" id="live-list"></div>
       <div class="info" id="flight-info" hidden></div>
     </section>
 
@@ -227,7 +257,7 @@
         </svg>
       </div>
       <div class="empty" id="empty">
-        <div><strong>Replay a flight on an AIP chart</strong>Load a KML track, then choose a chart.<br>Charts this flight crosses are found for you.</div>
+        <div><strong>Replay a flight on an AIP chart</strong>Load a KML track or follow a live flight, then choose a chart.<br>Charts the flight crosses are found for you.</div>
       </div>
       <div class="chart-title" id="chart-title" hidden></div>
       <div class="where" id="where" hidden></div>
@@ -246,6 +276,7 @@
       <button id="play" aria-label="Play">▶</button>
       <input type="range" id="seek" min="0" max="1000" step="1" value="0" aria-label="Time">
       <span class="clock" id="clock">--:--:--</span>
+      <span class="live-tag" id="live-tag" hidden><span class="live-dot"></span>Live</span>
       <select id="speed" aria-label="Speed">
         <option value="1">1×</option><option value="5">5×</option><option value="10">10×</option>
         <option value="30" selected>30×</option><option value="60">60×</option><option value="120">120×</option>

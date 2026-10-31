@@ -19,6 +19,15 @@ export function bearingDeg(a, b) {
   return (Math.atan2(y, x) / r + 360) % 360;
 }
 
+/** The point d meters from p along a great circle starting on a bearing. */
+export function offsetM(p, bearing, d) {
+  const r = Math.PI / 180, a = d / EARTH_RADIUS_M, b = bearing * r;
+  const lat1 = p.lat * r, lon1 = p.lon * r;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(a) + Math.cos(lat1) * Math.sin(a) * Math.cos(b));
+  const lon2 = lon1 + Math.atan2(Math.sin(b) * Math.sin(a) * Math.cos(lat1), Math.cos(a) - Math.sin(lat1) * Math.sin(lat2));
+  return { lat: lat2 / r, lon: ((lon2 / r + 540) % 360) - 180 };
+}
+
 // --- Projections, in meters (x east, y north) ------------------------------
 
 const webMercator = {

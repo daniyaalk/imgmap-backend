@@ -141,7 +141,7 @@ Without `--previous`, state is read from the output directory.
 
 ## Flight replay website (`site/`)
 
-`site/replay/` is a static page, published at `/replay/` beside the data: upload a KML or KMZ track (FlightAware, ForeFlight, Flightradar24, Google Earth) and watch the aircraft move on any georeferenced chart, with an altitude profile. It finds the charts the flight crosses from their footprints, using the AIP edition in force on the flight's date. The file never leaves the browser.
+`site/replay/` is a static page, published at `/replay/` beside the data: upload a KML or KMZ track (FlightAware, ForeFlight, Flightradar24, Google Earth), or follow a flight live, and watch the aircraft move on any georeferenced chart, with an altitude profile. It finds the charts the flight crosses from their footprints, using the AIP edition in force on the flight's date. The file never leaves the browser.
 
 It reads `/v1/` and `/pdf/` from its own origin, so the bucket needs no CORS rules. The positioning math (`geo.js`) is a port of the app's and is tested against the footprints the pipeline publishes.
 
@@ -150,6 +150,23 @@ node --test tests/site/*.test.mjs
 .venv/bin/python -m imgmap_backend.site serve      # http://localhost:8770/replay/, data from the live site
 .venv/bin/python -m imgmap_backend.site publish    # what .github/workflows/site.yml runs on each push to site/
 ```
+
+### Live flights (`live/`)
+
+The page can also follow a flight live: find one by callsign or registration, or list the aircraft on the open chart. Positions come from `/live/` on the same hostname, a Cloudflare Worker (`live/`) that asks the source and caches each answer for 5–10 s at the edge, so everyone following one flight costs one upstream call per period. The page polls every `pollS` seconds (the Worker says how often), stops while the tab is hidden, and moves the aircraft on between reports at its reported speed, track and vertical speed.
+
+The source is [adsb.lol](https://adsb.lol/): free, no key, data under the ODbL (the page credits it). Coverage comes from volunteers' receivers and is thin in parts of India. adsb.lol sends no CORS headers, which is one reason for the Worker; the other is that a paid source's key must stay off the page.
+
+**Changing the source** (e.g. to Flightradar24): add `live/src/<name>.js` with the same four members as `adsblol.js` (`source`, `pollS`, `cacheS`, and `area`/`search`/`aircraft` returning the shape described in `live/src/index.js`), register it in `PROVIDERS`, set `PROVIDER` in `wrangler.toml`, and put its key in a Worker secret (`npx wrangler secret put FR24_API_KEY`), read from `env`. A metered source wants a longer `pollS` and `cacheS`. The page doesn't change: aircraft `id`s are the provider's own.
+
+```sh
+node --test tests/live/*.test.mjs
+node live/dev.mjs                                   # the Worker on http://localhost:8787, no edge cache
+.venv/bin/python -m imgmap_backend.site serve --live http://localhost:8787
+cd live && npx wrangler deploy                      # what .github/workflows/live.yml runs on each push to live/
+```
+
+The Worker's route (`charts.daniyaalkhan.com/live/*`) needs an API token with *Workers Scripts: Edit* on the account and *Workers Routes: Edit* on the zone, stored as the repository secret `CLOUDFLARE_API_TOKEN` (with `vars.R2_ACCOUNT_ID` as the account).
 
 ## Costs and upkeep
 - **Storage:** India is roughly 3 GB of PDFs. Charts unchanged between editions are stored once, so growth per cycle is small.

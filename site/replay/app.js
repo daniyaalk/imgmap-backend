@@ -1,9 +1,11 @@
-// Flight replay: a KML track drawn on a georeferenced AIP chart from this
-// site's own /v1/ data, with the aircraft moving along it.
+// Flight replay: a KML track, or a live flight from /live/, drawn on a
+// georeferenced AIP chart from this site's own /v1/ data, with the aircraft
+// moving along it.
 
 import * as pdfjs from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs";
 import { Georeference, inPolygon, projection } from "./geo.js";
 import { parseKml, stateAt } from "./kml.js";
+import { LOST_AFTER_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart } from "./live.js";
 
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
 const JSZIP = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
@@ -17,6 +19,8 @@ pdfjs.GlobalWorkerOptions.workerPort = new Worker(
 
 /** Where /v1/ and /pdf/ live: this site, or ?data= for development. */
 const DATA = new URL(new URLSearchParams(location.search).get("data") ?? "/", location.href);
+/** The live positions API (live/ in the repository), on this site. */
+const LIVE = new URL("/live/", location.href);
 
 /** The official source of each country's AIP, credited on the page. */
 const SOURCES = {
@@ -32,6 +36,8 @@ const CATEGORY_ORDER = Object.keys(CATEGORIES);
 
 /** Track samples tested against each chart's footprint. */
 const COVERAGE_SAMPLES = 400;
+/** While following, how often the chart list is brought up to date. */
+const LIVE_RESEARCH_MS = 60000;
 
 const $ = (id) => document.getElementById(id);
 const stage = $("stage"), layer = $("layer"), marker = $("marker");
@@ -60,7 +66,8 @@ const S = {
   last: null,
   found: null, // charts the flight crosses, once searched
   searched: 0,
-  runs: { find: 0, open: 0 },
+  runs: { find: 0, open: 0, live: 0 },
+  live: null, // while following: {id, source, pollS, offset, timer, searchedAt, failures}
 };
 
 // --- Data ------------------------------------------------------------------
@@ -168,14 +175,20 @@ function aerodromeFilter() {
   return S.aerodromes?.includes(v) ? v : null;
 }
 
-/** Every usable chart whose footprint the flight passes through. */
-async function findCharts() {
+/**
+ * Every usable chart whose footprint the flight passes through. A quiet
+ * search (a live flight's update) keeps the current list until it's done.
+ */
+async function findCharts({ quiet = false } = {}) {
   const run = ++S.runs.find;
-  S.found = null;
-  S.searched = 0;
-  showCharts();
+  if (!quiet || !S.found) {
+    S.found = null;
+    S.searched = 0;
+    showCharts();
+  }
   if (!S.flight || !S.aerodromes) return; // chooseEdition searches once they're in
   const samples = sample(S.flight.points, COVERAGE_SAMPLES);
+  const now = S.flight.live ? S.flight.points.at(-1) : null;
   const found = [];
   const queue = [...S.aerodromes];
   const worker = async () => {
@@ -186,18 +199,21 @@ async function findCharts() {
         for (const c of ad.charts) {
           if (!usable(c) || !c.georef.footprint) continue;
           const n = samples.filter((p) => inPolygon(p, c.georef.footprint)).length;
-          if (n) found.push({ icao, chart: c, cover: n / samples.length, area: area(c.georef.footprint) });
+          const here = !!now && inPolygon(now, c.georef.footprint);
+          if (n || here) found.push({ icao, chart: c, cover: n / samples.length, here, area: area(c.georef.footprint) });
         }
       } catch { /* One aerodrome missing doesn't stop the search. */ }
       if (run !== S.runs.find) return;
       S.searched++;
-      showCharts();
+      if (!quiet) showCharts();
     }
   };
   await Promise.all(Array.from({ length: 6 }, worker));
   if (run !== S.runs.find) return;
-  // Most of the flight first; among equals, the more detailed chart.
-  S.found = found.sort((a, b) => b.cover - a.cover || a.area - b.area);
+  // Where a live aircraft is now, the most detailed first; then most of
+  // the flight; among equals, the more detailed chart.
+  S.found = found.sort((a, b) =>
+    b.here - a.here || (a.here ? a.area - b.area : b.cover - a.cover || a.area - b.area));
   showCharts();
 }
 
@@ -220,11 +236,14 @@ async function showCharts() {
     }
     const found = icao ? S.found.filter((f) => f.icao === icao) : S.found;
     const where = icao ? ` ${icao}` : "";
+    const plural = found.length === 1 ? "" : "s";
     box.replaceChildren(
-      found.length
-        ? status(`${found.length}${where} chart${found.length === 1 ? "" : "s"} this flight crosses, with the share of the flight on each`)
-        : status(`This flight doesn't cross any${where} chart placed on the map in ${S.edition.name}.`),
-      ...found.slice(0, icao ? undefined : 40).map((f) => chartButton(f.icao, f.chart, f.cover)),
+      !found.length
+        ? status(`This flight ${S.flight.live ? "isn't on and hasn't crossed" : "doesn't cross"} any${where} chart placed on the map in ${S.edition.name}.`)
+        : S.flight.live
+          ? status(`${found.length}${where} chart${plural} where the aircraft is now (marked “now”) or has been`)
+          : status(`${found.length}${where} chart${plural} this flight crosses, with the share of the flight on each`),
+      ...found.slice(0, icao ? undefined : 40).map((f) => chartButton(f.icao, f.chart, S.flight.live ? null : f.cover, f.here)),
     );
     return;
   }
@@ -247,14 +266,16 @@ async function showCharts() {
   }
 }
 
-function chartButton(icao, chart, cover) {
+function chartButton(icao, chart, cover, here = false) {
   const b = el("button", "chart");
   b.dataset.key = `${icao}/${chart.file}`;
   b.classList.toggle("on", S.chart != null && b.dataset.key === `${S.chart.icao}/${S.chart.file}`);
   b.append(
     el("span", "icao", icao),
     el("span", "title", chart.title),
-    el("span", "cover", cover == null ? "" : cover > 0 ? `${Math.max(1, Math.round(cover * 100))}%` : ""),
+    here
+      ? el("span", "cover here", "now")
+      : el("span", "cover", cover == null ? "" : cover > 0 ? `${Math.max(1, Math.round(cover * 100))}%` : ""),
     el("span", "cat", CATEGORIES[chart.category] ?? "Chart"),
   );
   b.title = chart.title;
@@ -300,6 +321,8 @@ async function openChart(icao, chart) {
     layer.style.height = `${S.H}px`;
     layer.hidden = false;
     title.textContent = `${icao} · ${chart.title} · drawing…`;
+    $("live-near").disabled = !chart.georef.footprint;
+    $("live-near").title = "";
     title.title = `${chart.title} (${S.edition.name}). Positioned from ${chart.georef.method}, about ${Math.round(chart.georef.accuracyM)} m.`;
     buildOverlay();
     fitView();
@@ -432,6 +455,7 @@ async function render() {
 // --- The flight ----------------------------------------------------------------
 
 async function loadFile(file) {
+  stopLive();
   const info = $("flight-info");
   info.hidden = false;
   info.replaceChildren(el("span", "muted", `Reading ${file.name}…`));
@@ -464,20 +488,25 @@ function setFlight(flight, fileName) {
   const alts = pts.map((p) => p.altM).filter((a) => a != null);
   const info = $("flight-info");
   const lines = [el("strong", null, flight.name ?? fileName)];
-  if (flight.timed) {
+  if (flight.live) {
+    // Filled in by showLiveInfo.
+  } else if (flight.timed) {
     const d = new Date(first);
     lines.push(el("div", "muted", `${d.toUTCString().slice(0, 16)} · ${clock(first)}–${clock(last)} UTC`));
   }
-  lines.push(el("div", "muted", [
+  if (!flight.live) lines.push(el("div", "muted", [
     `${duration(last - first)}`,
     `${pts.length.toLocaleString()} positions`,
     alts.length ? `up to ${Math.round(Math.max(...alts) / 0.3048).toLocaleString()} ft` : null,
   ].filter(Boolean).join(" · ")));
   if (!flight.timed) lines.push(el("div", "note", "This file has no times, so the flight is replayed at a steady 140 kt."));
-  if (!alts.length) lines.push(el("div", "note", "This file has no altitudes."));
+  if (!alts.length && !flight.live) lines.push(el("div", "note", "This file has no altitudes."));
   info.replaceChildren(...lines);
+  info.hidden = false;
   $("player").hidden = false;
-  $("profile-box").hidden = !alts.length;
+  $("player").classList.toggle("live", !!flight.live);
+  $("live-tag").hidden = !flight.live;
+  $("profile-box").hidden = !alts.length && !flight.live;
   profile.cols = null;
 
   // The charts in force on the day of the flight, when this site has them.
@@ -492,10 +521,10 @@ function setFlight(flight, fileName) {
 function updateFrame() {
   const f = S.flight;
   if (!f) return;
-  const st = S.state = stateAt(f.points, S.t);
+  const st = S.state = f.live ? liveStateAt(f.points, S.t) : stateAt(f.points, S.t);
   if (st.trackDeg != null) S.rotation = st.trackDeg;
   const first = f.points[0].t, last = f.points.at(-1).t;
-  $("seek").value = last > first ? Math.round((S.t - first) / (last - first) * 1000) : 0;
+  if (!f.live) $("seek").value = last > first ? Math.round((S.t - first) / (last - first) * 1000) : 0;
   $("clock").textContent = f.timed ? `${clock(S.t)} Z` : `+${duration(S.t - first, true)}`;
   setReadout("r-alt", st.altM == null ? null : (Math.round(st.altM / 0.3048 / 10) * 10).toLocaleString(), "ft");
   setReadout("r-gs", st.groundSpeedKt == null ? null : Math.round(st.groundSpeedKt), "kt");
@@ -536,6 +565,7 @@ function placeMarker() {
 
 function setPlaying(on) {
   const f = S.flight;
+  if (f?.live) return; // a live flight runs on the clock
   if (on && f && S.t >= f.points.at(-1).t) S.t = f.points[0].t;
   S.playing = on && !!f;
   S.last = null;
@@ -551,6 +581,181 @@ function tick(now) {
   S.last = now;
   updateFrame();
   if (S.t >= end) setPlaying(false); else requestAnimationFrame(tick);
+}
+
+// --- Live flights ---------------------------------------------------------------
+
+async function liveJson(path) {
+  const r = await fetch(new URL(path, LIVE));
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(body?.error ?? (r.status === 404 ? "live data isn't available on this site" : `${r.status}`));
+  return body;
+}
+
+/** Aircraft from the API (a search, or around a chart), listed to choose from. */
+async function findLive(path, what, footprint) {
+  const box = $("live-list");
+  const run = ++S.runs.live;
+  box.replaceChildren(el("p", "status", `Looking for aircraft ${what}…`));
+  let body;
+  try {
+    body = await liveJson(path);
+  } catch (e) {
+    if (run === S.runs.live) box.replaceChildren(el("p", "status error", `Couldn't get live aircraft: ${e.message}`));
+    return;
+  }
+  if (run !== S.runs.live) return;
+  const aircraft = footprint ? onChart(body.aircraft, footprint) : body.aircraft;
+  const offset = body.now - Date.now();
+  const credit = el("p", "status");
+  credit.append("Positions from ", link(body.source.name, body.source.url), ", reported by volunteers' receivers: some areas have few.");
+  if (!aircraft.length) {
+    box.replaceChildren(el("p", "status", `No aircraft reported ${what} right now.`), credit);
+    return;
+  }
+  box.replaceChildren(
+    el("p", "status", `${aircraft.length} aircraft ${what}`),
+    ...aircraft.slice(0, 30).map((a) => {
+      const b = el("button", "chart");
+      b.append(
+        el("span", "icao", label(a)),
+        el("span", "title", [a.reg === label(a) ? null : a.reg, a.type].filter(Boolean).join(" · ") || "—"),
+        el("span", "cover", altitudeText(a)),
+        el("span", "cat", [a.gsKt == null ? null : `${Math.round(a.gsKt)} kt`, `seen ${ago(Date.now() + offset - a.t)} ago`].filter(Boolean).join(" · ")),
+      );
+      b.onclick = () => startLive(a, body);
+      return b;
+    }),
+    credit,
+  );
+}
+
+/** Follows an aircraft: its reports become the flight, the clock runs on now. */
+function startLive(a, body) {
+  stopLive();
+  S.runs.live++;
+  $("live-list").replaceChildren();
+  const points = [];
+  addFix(points, a);
+  setFlight({ name: label(a), points, timed: true, live: true, aircraft: a }, null);
+  S.live = {
+    id: a.id,
+    source: body.source,
+    pollS: body.pollS ?? 15,
+    offset: body.now - Date.now(),
+    searchedAt: Date.now(),
+    failures: 0,
+    timer: null,
+    shownAt: 0,
+  };
+  S.t = Date.now() + S.live.offset;
+  showLiveInfo();
+  schedulePoll();
+  requestAnimationFrame(liveTick);
+}
+
+function stopLive(reason) {
+  if (!S.live) return;
+  clearTimeout(S.live.timer);
+  S.live = null;
+  if (S.flight?.live) {
+    // What was flown stays on screen, without the clock running.
+    S.flight.ended = reason ?? "Stopped following.";
+    showLiveInfo();
+  }
+}
+
+function schedulePoll() {
+  const L = S.live;
+  clearTimeout(L.timer);
+  // Errors back off up to two minutes.
+  const wait = L.pollS * 1000 * Math.min(8, 2 ** L.failures);
+  L.timer = setTimeout(poll, wait);
+}
+
+async function poll() {
+  const L = S.live;
+  if (!L) return;
+  clearTimeout(L.timer);
+  if (document.hidden) return; // visibilitychange calls again
+  let body;
+  try {
+    body = await liveJson(`aircraft/${encodeURIComponent(L.id)}`);
+    L.failures = 0;
+    L.error = null;
+  } catch (e) {
+    if (S.live !== L) return;
+    L.failures++;
+    L.error = e.message;
+    showLiveInfo();
+    schedulePoll();
+    return;
+  }
+  if (S.live !== L) return;
+  L.offset = body.now - Date.now();
+  L.pollS = body.pollS ?? L.pollS;
+  const a = body.aircraft.find((x) => x.id === L.id);
+  const f = S.flight;
+  if (a && addFix(f.points, a)) {
+    f.aircraft = a;
+    const p = f.points.at(-1);
+    if (S.px) S.px.push(S.geo.toPixel(p));
+    layer.querySelector(".trail")?.setAttribute("d", S.px ? path(S.px) : "");
+    profile.cols = null;
+    if (Date.now() - L.searchedAt > LIVE_RESEARCH_MS) {
+      L.searchedAt = Date.now();
+      findCharts({ quiet: true });
+    }
+  }
+  if (body.now - f.points.at(-1).t > LOST_AFTER_MS) {
+    stopLive(`No reports for ${Math.round(LOST_AFTER_MS / 60000)} minutes: it has landed or left receiver coverage.`);
+    return;
+  }
+  showLiveInfo();
+  schedulePoll();
+}
+
+function liveTick() {
+  const L = S.live;
+  if (!L) return;
+  S.t = Date.now() + L.offset;
+  updateFrame();
+  // The report's age, once a second.
+  if (Date.now() - L.shownAt > 1000) showLiveInfo();
+  requestAnimationFrame(liveTick);
+}
+
+function showLiveInfo() {
+  const f = S.flight;
+  if (!f?.live) return;
+  const a = f.aircraft, L = S.live;
+  if (L) L.shownAt = Date.now();
+  const age = (L ? Date.now() + L.offset : f.points.at(-1).t) - f.points.at(-1).t;
+  const stale = age > 30000;
+  const lines = [el("strong", null, [label(a), a.reg && a.reg !== label(a) ? a.reg : null, a.type].filter(Boolean).join(" · "))];
+  if (L) {
+    const state = el("div", "muted");
+    const dot = el("span", `live-dot${stale ? " stale" : ""}`);
+    state.append(dot, `Live · last report ${ago(age)} ago · ${f.points.length.toLocaleString()} report${f.points.length === 1 ? "" : "s"}`);
+    lines.push(state);
+    if (stale) lines.push(el("div", "note", `No report for ${ago(age)}: shown where it would be at its last speed and track, for up to a minute.`));
+    if (L.error) lines.push(el("div", "note", `Couldn't reach live data (${L.error}); trying again.`));
+  } else {
+    lines.push(el("div", "muted", `${f.points.length.toLocaleString()} reports · ${clock(f.points[0].t)}–${clock(f.points.at(-1).t)} UTC`));
+    lines.push(el("div", "note", f.ended));
+  }
+  const credit = el("div", "muted");
+  const source = L?.source ?? f.source;
+  if (source) credit.append("Positions from ", link(source.name, source.url));
+  f.source = source;
+  lines.push(credit);
+  if (L) {
+    const stop = el("button", "btn wide", "Stop following");
+    stop.type = "button";
+    stop.onclick = () => stopLive();
+    lines.push(stop);
+  }
+  $("flight-info").replaceChildren(...lines);
 }
 
 // --- Altitude profile ---------------------------------------------------------
@@ -620,7 +825,7 @@ function drawProfile() {
   }
 
   const pts = S.flight.points, first = pts[0].t, span = pts.at(-1).t - first || 1;
-  const nowX = (S.t - first) / span * plotW;
+  const nowX = Math.min(plotW, (S.t - first) / span * plotW);
   const area = (from, to) => {
     ctx.beginPath();
     let open = false;
@@ -705,7 +910,7 @@ function wireProfile() {
     updateFrame();
   };
   canvas.addEventListener("pointerdown", (e) => {
-    if (!S.flight) return;
+    if (!S.flight || S.flight.live) return;
     seeking = true;
     canvas.setPointerCapture(e.pointerId);
     seek(e);
@@ -737,6 +942,22 @@ function wireUi() {
     });
   }
 
+  $("live-form").onsubmit = (e) => {
+    e.preventDefault();
+    const q = $("live-q").value.trim();
+    if (q) findLive(`search?q=${encodeURIComponent(q)}`, `“${q.toUpperCase()}”`);
+  };
+  $("live-near").onclick = () => {
+    const fp = S.chart?.georef.footprint;
+    if (!fp) return;
+    const { lat, lon, nm } = areaAround(fp);
+    findLive(`area?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&nm=${nm}`, "on this chart", fp);
+  };
+  document.addEventListener("visibilitychange", () => {
+    // Hidden tabs don't ask; on return, catch up at once.
+    if (!document.hidden && S.live) poll();
+  });
+
   const icao = $("icao");
   icao.oninput = () => {
     const v = icao.value.trim().toUpperCase();
@@ -765,7 +986,7 @@ function wireUi() {
   };
 
   addEventListener("keydown", (e) => {
-    if (e.target.closest("input, select, textarea") || !S.flight) return;
+    if (e.target.closest("input, select, textarea") || !S.flight || S.flight.live) return;
     if (e.key === " ") { e.preventDefault(); setPlaying(!S.playing); }
     if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
       const f = S.flight.points;
@@ -857,6 +1078,11 @@ function duration(ms, withSeconds = false) {
   const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
   if (withSeconds) return `${h ? `${h}:` : ""}${String(m).padStart(h ? 2 : 1, "0")}:${String(s % 60).padStart(2, "0")}`;
   return h ? `${h} h ${m} min` : `${m} min`;
+}
+
+/** "4 s", "2:05": how long ago something was reported. */
+function ago(ms) {
+  return ms < 60000 ? `${Math.max(0, Math.round(ms / 1000))} s` : duration(ms, true);
 }
 
 function formatDate(iso) {

@@ -1,0 +1,16 @@
+# The /live/ API beside the replay page: a Cloudflare Worker on the site's
+# own hostname. Deploy with `npx wrangler deploy` from this folder (or the
+# live workflow). See the README's "Live flights" section.
+name = "aipchart-live"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+
+routes = [
+  { pattern = "charts.daniyaalkhan.com/live/*", zone_name = "daniyaalkhan.com" },
+]
+
+[vars]
+# Where positions come from: "adsblol" (free). A provider that needs a key
+# reads it from a secret (`npx wrangler secret put ...`), never from here.
+PROVIDER = "adsblol"

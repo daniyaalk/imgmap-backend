@@ -4,13 +4,16 @@
     python -m imgmap_backend.site serve        # preview on http://localhost:8770/replay/
 
 Pages read /v1/ and /pdf/ from their own origin, so the data needs no CORS.
-The preview server passes those paths through to the live data.
+The preview server passes those paths through to the live data, and /live/
+(live flight positions, the Worker in live/) to --live: the live site, or
+`node live/dev.mjs` for a Worker being changed.
 """
 
 from __future__ import annotations
 
 import argparse
 import http.server
+import json
 import mimetypes
 from pathlib import Path
 
@@ -61,7 +64,7 @@ def publish(publisher: R2Publisher):
         print(f"published {key} (redirect)")
 
 
-def serve(port: int, upstream: str):
+def serve(port: int, upstream: str, live: str):
     cache: dict[str, tuple[int, str, bytes]] = {}  # spares the live host repeat fetches
 
     def fetch(path):
@@ -77,7 +80,19 @@ def serve(port: int, upstream: str):
             super().__init__(*args, directory=str(SITE), **kwargs)
 
         def do_GET(self):
-            if self.path.startswith(("/v1/", "/pdf/")):
+            if self.path.startswith("/live/"):
+                # Positions change: never cached here.
+                try:
+                    r = requests.get(live.rstrip("/") + self.path, timeout=30)
+                    status, ctype, body = r.status_code, r.headers.get("Content-Type", "application/json"), r.content
+                except requests.RequestException as e:
+                    status, ctype, body = 502, "application/json", json.dumps({"error": f"{live}: {e}"}).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path.startswith(("/v1/", "/pdf/")):
                 status, ctype, body = fetch(self.path)
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
@@ -90,7 +105,7 @@ def serve(port: int, upstream: str):
         def guess_type(self, path):
             return content_type(Path(path))
 
-    print(f"http://localhost:{port}/replay/  (data from {upstream})")
+    print(f"http://localhost:{port}/replay/  (data from {upstream}, live flights from {live})")
     http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
@@ -101,11 +116,12 @@ def main():
     s = sub.add_parser("serve", help="preview locally")
     s.add_argument("--port", type=int, default=8770)
     s.add_argument("--upstream", default="https://charts.daniyaalkhan.com/")
+    s.add_argument("--live", help="where /live/ comes from (default: --upstream; http://localhost:8787 for live/dev.mjs)")
     args = p.parse_args()
     if args.command == "publish":
         publish(R2Publisher.from_env())
     else:
-        serve(args.port, args.upstream)
+        serve(args.port, args.upstream, args.live or args.upstream)
 
 
 if __name__ == "__main__":
