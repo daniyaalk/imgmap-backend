@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { distanceM } from "../../site/replay/geo.js";
-import { MAX_AHEAD_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, trafficShown } from "../../site/replay/live.js";
+import { MAX_AHEAD_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, parseAltitude, trafficShown } from "../../site/replay/live.js";
 
 const report = (over = {}) => ({
   id: "8015fc", callsign: "IGO402", reg: "VT-IPU", type: "A20N", t: 1_000_000,
@@ -72,4 +72,25 @@ test("traffic leaves out the followed aircraft, and the ground when asked", () =
   assert.deepEqual(trafficShown(all).map((a) => a.id), ["a", "b", "c"]);
   assert.deepEqual(trafficShown(all, { hideGround: true }).map((a) => a.id), ["a", "c"]);
   assert.deepEqual(trafficShown(all, { hideGround: true, exclude: "c" }).map((a) => a.id), ["a"]);
+});
+
+test("reads altitudes as feet or flight levels", () => {
+  assert.equal(parseAltitude("5000"), 5000);
+  assert.equal(parseAltitude(" 5,000 ft "), 5000);
+  assert.equal(parseAltitude("fl100"), 10000);
+  assert.equal(parseAltitude("FL 095"), 9500);
+  assert.equal(parseAltitude(""), null);
+  assert.ok(Number.isNaN(parseAltitude("high")));
+  assert.ok(Number.isNaN(parseAltitude("-200")));
+});
+
+test("traffic keeps only the altitude band, when one is set", () => {
+  const at = (id, altFt, over = {}) => report({ id, altFt, ...over });
+  const all = [at("low", 2000), at("mid", 9000), at("high", 33000), at("unknown", null), at("ground", null, { onGround: true })];
+  const ids = (f) => trafficShown(all, f).map((a) => a.id);
+  assert.deepEqual(ids({}), ["low", "mid", "high", "unknown", "ground"], "no band: everything");
+  assert.deepEqual(ids({ minFt: 3000, maxFt: 15000 }), ["mid"]);
+  assert.deepEqual(ids({ minFt: 3000 }), ["mid", "high"]);
+  assert.deepEqual(ids({ maxFt: 9000 }), ["low", "mid", "ground"], "inclusive; the ground is 0 ft");
+  assert.deepEqual(ids({ maxFt: 9000, hideGround: true }), ["low", "mid"]);
 });

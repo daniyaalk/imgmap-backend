@@ -87,7 +87,30 @@ export function altitudeText(a) {
   return a.altFt >= 10000 ? `FL${String(Math.round(a.altFt / 100)).padStart(3, "0")}` : `${(Math.round(a.altFt / 10) * 10).toLocaleString()} ft`;
 }
 
-/** The traffic to draw: without the aircraft being followed, and without those on the ground if asked. */
-export function trafficShown(aircraft, { hideGround = false, exclude = null } = {}) {
-  return aircraft.filter((a) => a.id !== exclude && !(hideGround && a.onGround));
+/**
+ * An altitude typed as feet ("5000", "5,000 ft") or a flight level
+ * ("FL100"), in feet: null when empty, NaN when it isn't one.
+ */
+export function parseAltitude(text) {
+  const t = String(text ?? "").trim().toUpperCase().replace(/[,\s]/g, "").replace(/FT$/, "");
+  if (!t) return null;
+  const m = /^(FL)?(\d{1,5})$/.exec(t);
+  if (!m) return NaN;
+  return m[1] ? Number(m[2]) * 100 : Number(m[2]);
+}
+
+/**
+ * The traffic to draw: without the aircraft being followed; without those
+ * on the ground, if asked; and, with an altitude band (feet, either end
+ * optional), only those reported inside it (the ground is 0 ft; no
+ * altitude is outside any band).
+ */
+export function trafficShown(aircraft, { hideGround = false, minFt = null, maxFt = null, exclude = null } = {}) {
+  const band = minFt != null || maxFt != null;
+  return aircraft.filter((a) => {
+    if (a.id === exclude || (hideGround && a.onGround)) return false;
+    if (!band) return true;
+    const alt = a.onGround ? 0 : a.altFt;
+    return alt != null && (minFt == null || alt >= minFt) && (maxFt == null || alt <= maxFt);
+  });
 }

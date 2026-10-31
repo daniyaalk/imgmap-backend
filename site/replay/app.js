@@ -5,7 +5,7 @@
 import * as pdfjs from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs";
 import { Georeference, inPolygon, projection } from "./geo.js";
 import { parseKml, stateAt } from "./kml.js";
-import { LOST_AFTER_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, toPoint, trafficShown } from "./live.js";
+import { LOST_AFTER_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, parseAltitude, toPoint, trafficShown } from "./live.js";
 
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
 const JSZIP = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
@@ -778,7 +778,12 @@ function trafficPrefs() {
 
 function saveTrafficPrefs() {
   try {
-    localStorage.setItem(TRAFFIC_PREFS, JSON.stringify({ on: $("traffic").checked, hideGround: $("traffic-ground").checked }));
+    localStorage.setItem(TRAFFIC_PREFS, JSON.stringify({
+      on: $("traffic").checked,
+      hideGround: $("traffic-ground").checked,
+      min: $("traffic-min").value,
+      max: $("traffic-max").value,
+    }));
   } catch { /* Only a convenience. */ }
 }
 
@@ -795,7 +800,7 @@ function setTraffic() {
   T.error = null;
   T.failures = 0;
   T.at = null;
-  $("traffic-ground").disabled = !$("traffic").checked;
+  for (const id of ["traffic-ground", "traffic-min", "traffic-max"]) $(id).disabled = !$("traffic").checked;
   drawTraffic();
   if (trafficWanted()) pollTraffic();
 }
@@ -829,7 +834,7 @@ async function pollTraffic() {
 function drawTraffic() {
   const T = S.traffic, box = $("traffic-layer");
   const on = trafficWanted();
-  const shown = on ? trafficShown(T.aircraft, { hideGround: $("traffic-ground").checked }) : [];
+  const shown = on ? trafficShown(T.aircraft, trafficFilter()) : [];
   const keep = new Set(shown.map((a) => a.id));
   for (const [id, el] of T.els) if (!keep.has(id)) { el.remove(); T.els.delete(id); }
   for (const a of shown) {
@@ -891,6 +896,16 @@ function trafficTick() {
   requestAnimationFrame(trafficTick);
 }
 
+/** The filters as typed; a bound that isn't an altitude is marked and ignored. */
+function trafficFilter() {
+  const bound = (id) => {
+    const ft = parseAltitude($(id).value);
+    $(id).setAttribute("aria-invalid", String(Number.isNaN(ft)));
+    return Number.isNaN(ft) ? null : ft;
+  };
+  return { hideGround: $("traffic-ground").checked, minFt: bound("traffic-min"), maxFt: bound("traffic-max") };
+}
+
 function showTrafficStatus(shown) {
   const T = S.traffic, box = $("traffic-status");
   box.hidden = !trafficWanted();
@@ -899,9 +914,16 @@ function showTrafficStatus(shown) {
     box.textContent = T.error ? `Couldn't get live aircraft: ${T.error}` : "Looking for aircraft on this chart…";
     return;
   }
-  const ground = $("traffic-ground").checked ? T.aircraft.filter((a) => a.onGround).length : 0;
+  const { hideGround, minFt, maxFt } = trafficFilter();
+  const ground = hideGround ? T.aircraft.filter((a) => a.onGround).length : 0;
+  const band = T.aircraft.length - ground - shown;
   const parts = [`${shown} aircraft on this chart`];
   if (ground) parts.push(`${ground} on the ground hidden`);
+  if (band > 0) {
+    const ft = (v) => v >= 10000 && v % 100 === 0 ? `FL${String(v / 100).padStart(3, "0")}` : `${v.toLocaleString()} ft`;
+    const where = minFt != null && maxFt != null ? `outside ${ft(minFt)}–${ft(maxFt)}` : minFt != null ? `below ${ft(minFt)}` : `above ${ft(maxFt)}`;
+    parts.push(`${band} ${where} hidden`);
+  }
   parts.push(`as of ${clock(T.at)} Z`);
   box.replaceChildren(parts.join(" · "), ". Click one to follow it.");
   if (T.error) box.append(` Couldn't update (${T.error}); trying again.`);
@@ -1111,6 +1133,9 @@ function wireUi() {
   const prefs = trafficPrefs();
   $("traffic").checked = !!prefs.on;
   $("traffic-ground").checked = !!prefs.hideGround;
+  $("traffic-min").value = prefs.min ?? "";
+  $("traffic-max").value = prefs.max ?? "";
+  for (const id of ["traffic-min", "traffic-max"]) $(id).oninput = () => { saveTrafficPrefs(); drawTraffic(); };
   $("traffic").onchange = () => { saveTrafficPrefs(); setTraffic(); };
   $("traffic-ground").onchange = () => { saveTrafficPrefs(); drawTraffic(); };
 

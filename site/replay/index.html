@@ -108,6 +108,11 @@
   .check.sub { margin-top: 4px; padding-left: 24px; color: var(--muted); }
   .check input { accent-color: var(--traffic); margin: 0; }
   .check:has(input:disabled) { cursor: default; opacity: .55; }
+  .band { display: flex; gap: 6px; align-items: center; margin-top: 6px; padding-left: 24px; font-size: 13px; color: var(--muted); }
+  .band input { flex: 1; min-width: 0; padding: 5px 7px; text-transform: uppercase; }
+  .band input::placeholder { text-transform: none; }
+  .band input:disabled { opacity: .55; }
+  .band input[aria-invalid="true"] { border-color: #d33; }
 
   .traffic { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
   .ac {
@@ -251,6 +256,13 @@
       <button class="btn wide" id="live-near" type="button" disabled title="Open a chart first">Aircraft on this chart</button>
       <label class="check"><input type="checkbox" id="traffic" disabled> Show all aircraft on this chart</label>
       <label class="check sub"><input type="checkbox" id="traffic-ground" disabled> Hide aircraft on the ground</label>
+      <div class="band" title="Feet (5000) or a flight level (FL100); leave either empty">
+        <input type="text" id="traffic-min" placeholder="Min, e.g. 3000" maxlength="9" disabled
+               autocomplete="off" spellcheck="false" aria-label="Lowest altitude shown (feet or FL)">
+        <span>to</span>
+        <input type="text" id="traffic-max" placeholder="Max, e.g. FL150" maxlength="9" disabled
+               autocomplete="off" spellcheck="false" aria-label="Highest altitude shown (feet or FL)">
+      </div>
       <p class="status" id="traffic-status" hidden></p>
       <div class="list" id="live-list"></div>
       <div class="info" id="flight-info" hidden></div>
