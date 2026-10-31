@@ -86,6 +86,11 @@ test("errors say whose they are, and aren't cached", async () => {
   assert.equal((await ask("/live/aircraft/not-hex")).status, 400);
   assert.equal((await ask("/live/area?lat=north")).status, 400);
   assert.equal((await ask("/live/nothing")).status, 404);
+  for (const bare of ["/live", "/live/"]) {
+    const about = await ask(bare);
+    assert.equal(about.status, 200, bare);
+    assert.equal(about.body.endpoints.length, 3);
+  }
   upstream([], 503);
   const down = await ask("/live/aircraft/8015fc");
   assert.equal(down.status, 502);

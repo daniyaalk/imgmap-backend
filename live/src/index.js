@@ -32,6 +32,19 @@ export default {
     const provider = PROVIDERS[env.PROVIDER ?? "adsblol"];
     if (!provider) return reply({ error: `unknown provider ${env.PROVIDER}` }, 500);
 
+    // The bare path describes the API, for anyone who opens it.
+    if (/^\/live\/?$/.test(url.pathname)) {
+      return reply({
+        about: "Live aircraft positions for the flight replay page (https://charts.daniyaalkhan.com/replay/).",
+        source: provider.source,
+        endpoints: [
+          "/live/area?lat=28.56&lon=77.10&nm=40",
+          "/live/search?q=IGO402",
+          "/live/aircraft/<id>",
+        ],
+      }, 200, 300);
+    }
+
     let route;
     try {
       route = parse(url);
