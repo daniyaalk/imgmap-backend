@@ -15,6 +15,7 @@
     --line: #dfe3e8;
     --accent: #c2187d;
     --accent-soft: #c2187d1f;
+    --traffic: #1a6fd6;
     --warn-bg: #fff4d6;
     --warn-text: #6b4a00;
     --stage: #c9ced6;
@@ -30,6 +31,7 @@
       --line: #2c323a;
       --accent: #f052a9;
       --accent-soft: #f052a926;
+      --traffic: #6aa8ff;
       --warn-bg: #3a2f12;
       --warn-text: #f2d48a;
       --stage: #0b0d10;
@@ -39,7 +41,7 @@
   }
   :root[data-theme="dark"] {
     --bg: #111418; --panel: #1a1e24; --text: #e7eaee; --muted: #9aa4b0; --line: #2c323a;
-    --accent: #f052a9; --accent-soft: #f052a926; --warn-bg: #3a2f12; --warn-text: #f2d48a;
+    --accent: #f052a9; --accent-soft: #f052a926; --traffic: #6aa8ff; --warn-bg: #3a2f12; --warn-text: #f2d48a;
     --stage: #0b0d10; --shadow: 0 1px 2px #0006, 0 4px 16px #0005; color-scheme: dark;
   }
 
@@ -102,6 +104,29 @@
   @keyframes pulse { 50% { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
   .chart .here { color: #e0362c; }
+  .check { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 13px; cursor: pointer; }
+  .check.sub { margin-top: 4px; padding-left: 24px; color: var(--muted); }
+  .check input { accent-color: var(--traffic); margin: 0; }
+  .check:has(input:disabled) { cursor: default; opacity: .55; }
+
+  .traffic { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .ac {
+    position: absolute; left: 0; top: 0; width: 0; height: 0; padding: 0; border: 0; background: none;
+    pointer-events: none;
+  }
+  .ac svg {
+    position: absolute; left: -12px; top: -12px; width: 24px; height: 24px; pointer-events: auto; cursor: pointer;
+    filter: drop-shadow(0 1px 1px #0009);
+  }
+  .ac path { fill: var(--traffic); }
+  .ac span {
+    position: absolute; left: 11px; top: 4px; white-space: nowrap; pointer-events: auto; cursor: pointer;
+    padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--text); box-shadow: var(--shadow);
+    font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.35;
+  }
+  .ac.ground path { fill: var(--muted); }
+  .ac.stale { opacity: .5; }
+  .ac:hover span, .ac:focus-visible span { outline: 2px solid var(--traffic); }
 
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; min-width: 0; }
@@ -224,6 +249,9 @@
         <button class="btn" type="submit">Find</button>
       </form>
       <button class="btn wide" id="live-near" type="button" disabled title="Open a chart first">Aircraft on this chart</button>
+      <label class="check"><input type="checkbox" id="traffic" disabled> Show all aircraft on this chart</label>
+      <label class="check sub"><input type="checkbox" id="traffic-ground" disabled> Hide aircraft on the ground</label>
+      <p class="status" id="traffic-status" hidden></p>
       <div class="list" id="live-list"></div>
       <div class="info" id="flight-info" hidden></div>
     </section>
@@ -250,6 +278,7 @@
   <section class="viewer">
     <div class="stage" id="stage">
       <div class="layer" id="layer" hidden></div>
+      <div class="traffic" id="traffic-layer"></div>
       <div class="marker" id="marker" hidden>
         <svg viewBox="-17 -17 34 34" aria-hidden="true">
           <path d="M0 -15 L2.2 -6 L2.2 -2 L14 4 L14 7 L2.2 4 L1.8 11 L5.5 14 L5.5 16 L0 14.5 L-5.5 16 L-5.5 14 L-1.8 11 L-2.2 4 L-14 7 L-14 4 L-2.2 -2 L-2.2 -6 Z"

@@ -86,3 +86,8 @@ export function altitudeText(a) {
   if (a.altFt == null) return "—";
   return a.altFt >= 10000 ? `FL${String(Math.round(a.altFt / 100)).padStart(3, "0")}` : `${(Math.round(a.altFt / 10) * 10).toLocaleString()} ft`;
 }
+
+/** The traffic to draw: without the aircraft being followed, and without those on the ground if asked. */
+export function trafficShown(aircraft, { hideGround = false, exclude = null } = {}) {
+  return aircraft.filter((a) => a.id !== exclude && !(hideGround && a.onGround));
+}

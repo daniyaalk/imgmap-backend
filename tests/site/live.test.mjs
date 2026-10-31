@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { distanceM } from "../../site/replay/geo.js";
-import { MAX_AHEAD_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart } from "../../site/replay/live.js";
+import { MAX_AHEAD_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, trafficShown } from "../../site/replay/live.js";
 
 const report = (over = {}) => ({
   id: "8015fc", callsign: "IGO402", reg: "VT-IPU", type: "A20N", t: 1_000_000,
@@ -64,4 +64,12 @@ test("names and altitudes", () => {
   assert.equal(altitudeText(report({ altFt: 9500 })), "9,500 ft");
   assert.equal(altitudeText(report({ onGround: true })), "Ground");
   assert.equal(altitudeText(report({ altFt: null })), "—");
+});
+
+test("traffic leaves out the followed aircraft, and the ground when asked", () => {
+  const air = report({ id: "a" }), taxiing = report({ id: "b", onGround: true }), followed = report({ id: "c" });
+  const all = [air, taxiing, followed];
+  assert.deepEqual(trafficShown(all).map((a) => a.id), ["a", "b", "c"]);
+  assert.deepEqual(trafficShown(all, { hideGround: true }).map((a) => a.id), ["a", "c"]);
+  assert.deepEqual(trafficShown(all, { hideGround: true, exclude: "c" }).map((a) => a.id), ["a"]);
 });

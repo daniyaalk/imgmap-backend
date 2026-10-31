@@ -153,7 +153,7 @@ node --test tests/site/*.test.mjs
 
 ### Live flights (`live/`)
 
-The page can also follow a flight live: find one by callsign or registration, or list the aircraft on the open chart. Positions come from `/live/` on the same hostname, a Cloudflare Worker (`live/`) that asks the source and caches each answer for 5–10 s at the edge, so everyone following one flight costs one upstream call per period. The page polls every `pollS` seconds (the Worker says how often), stops while the tab is hidden, and moves the aircraft on between reports at its reported speed, track and vertical speed.
+The page can also follow a flight live: find one by callsign or registration, or list the aircraft on the open chart. *Show all aircraft on this chart* draws every reported aircraft on the open chart (optionally not those on the ground), updated each poll with one area request for the chart, and clicking one follows it. Positions come from `/live/` on the same hostname, a Cloudflare Worker (`live/`) that asks the source and caches each answer for 5–10 s at the edge, so everyone following one flight costs one upstream call per period. The page polls every `pollS` seconds (the Worker says how often), stops while the tab is hidden, and moves the aircraft on between reports at its reported speed, track and vertical speed.
 
 The source is [adsb.lol](https://adsb.lol/): free, no key, data under the ODbL (the page credits it). Coverage comes from volunteers' receivers and is thin in parts of India. adsb.lol sends no CORS headers, which is one reason for the Worker; the other is that a paid source's key must stay off the page.
 

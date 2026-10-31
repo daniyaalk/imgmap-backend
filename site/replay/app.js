@@ -5,7 +5,7 @@
 import * as pdfjs from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs";
 import { Georeference, inPolygon, projection } from "./geo.js";
 import { parseKml, stateAt } from "./kml.js";
-import { LOST_AFTER_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart } from "./live.js";
+import { LOST_AFTER_MS, addFix, altitudeText, areaAround, label, liveStateAt, onChart, toPoint, trafficShown } from "./live.js";
 
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.mjs";
 const JSZIP = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
@@ -68,6 +68,8 @@ const S = {
   searched: 0,
   runs: { find: 0, open: 0, live: 0 },
   live: null, // while following: {id, source, pollS, offset, timer, searchedAt, failures}
+  // Every aircraft on the open chart, when shown.
+  traffic: { aircraft: [], els: new Map(), offset: 0, pollS: 10, source: null, timer: null, run: 0, failures: 0, error: null, at: null, loop: false },
 };
 
 // --- Data ------------------------------------------------------------------
@@ -323,9 +325,11 @@ async function openChart(icao, chart) {
     title.textContent = `${icao} · ${chart.title} · drawing…`;
     $("live-near").disabled = !chart.georef.footprint;
     $("live-near").title = "";
+    $("traffic").disabled = !chart.georef.footprint;
     title.title = `${chart.title} (${S.edition.name}). Positioned from ${chart.georef.method}, about ${Math.round(chart.georef.accuracyM)} m.`;
     buildOverlay();
     fitView();
+    setTraffic();
     if (S.flight) updateFrame(); else applyView();
   } catch (e) {
     if (run === S.runs.open) title.textContent = `${icao} · ${chart.title}: couldn't open (${e.message})`;
@@ -402,6 +406,7 @@ function applyView() {
   const v = S.view;
   layer.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.s})`;
   placeMarker();
+  placeTraffic();
   if (S.page && Math.abs(S.renderedScale - v.s) / v.s > 0.02) {
     clearTimeout(S.renderTimer);
     S.renderTimer = setTimeout(render, S.renderedScale ? 150 : 0);
@@ -556,11 +561,16 @@ function placeMarker() {
   marker.style.transform = `translate(${x}px, ${y}px) rotate(${angle}rad)`;
   const u = p[0] / S.W, v = p[1] / S.H;
   const off = u < 0 || u > 1 || v < 0 || v > 1;
-  const nts = (S.chart.georef.notToScale ?? []).some(([u1, v1, u2, v2]) =>
-    u >= Math.min(u1, u2) && u <= Math.max(u1, u2) && v >= Math.min(v1, v2) && v <= Math.max(v1, v2));
+  const nts = notToScale(u, v);
   marker.classList.toggle("dim", off || nts);
   where.hidden = !(off || nts);
   where.textContent = off ? "Off this chart" : "In a part drawn not to scale: position approximate";
+}
+
+/** Whether a page position (0–1) is in a part of the chart drawn not to scale. */
+function notToScale(u, v) {
+  return (S.chart.georef.notToScale ?? []).some(([u1, v1, u2, v2]) =>
+    u >= Math.min(u1, u2) && u <= Math.max(u1, u2) && v >= Math.min(v1, v2) && v <= Math.max(v1, v2));
 }
 
 function setPlaying(on) {
@@ -756,6 +766,145 @@ function showLiveInfo() {
     lines.push(stop);
   }
   $("flight-info").replaceChildren(...lines);
+}
+
+// --- Traffic: every aircraft on the chart ----------------------------------------
+
+const TRAFFIC_PREFS = "replay.traffic";
+
+function trafficPrefs() {
+  try { return JSON.parse(localStorage.getItem(TRAFFIC_PREFS)) ?? {}; } catch { return {}; }
+}
+
+function saveTrafficPrefs() {
+  try {
+    localStorage.setItem(TRAFFIC_PREFS, JSON.stringify({ on: $("traffic").checked, hideGround: $("traffic-ground").checked }));
+  } catch { /* Only a convenience. */ }
+}
+
+function trafficWanted() {
+  return $("traffic").checked && !!S.chart?.georef.footprint;
+}
+
+/** Starts, restarts (a new chart) or stops showing traffic. */
+function setTraffic() {
+  const T = S.traffic;
+  clearTimeout(T.timer);
+  T.run++;
+  T.aircraft = [];
+  T.error = null;
+  T.failures = 0;
+  T.at = null;
+  $("traffic-ground").disabled = !$("traffic").checked;
+  drawTraffic();
+  if (trafficWanted()) pollTraffic();
+}
+
+async function pollTraffic() {
+  const T = S.traffic, run = T.run;
+  clearTimeout(T.timer);
+  if (document.hidden || !trafficWanted()) return; // visibilitychange calls again
+  const footprint = S.chart.georef.footprint;
+  const { lat, lon, nm } = areaAround(footprint);
+  try {
+    const body = await liveJson(`area?lat=${lat.toFixed(3)}&lon=${lon.toFixed(3)}&nm=${nm}`);
+    if (run !== T.run) return;
+    T.aircraft = onChart(body.aircraft, footprint).map((a) => ({ ...a, point: toPoint(a) }));
+    T.offset = body.now - Date.now();
+    T.pollS = body.pollS ?? T.pollS;
+    T.source = body.source;
+    T.at = body.now;
+    T.failures = 0;
+    T.error = null;
+  } catch (e) {
+    if (run !== T.run) return;
+    T.failures++;
+    T.error = e.message;
+  }
+  drawTraffic();
+  T.timer = setTimeout(pollTraffic, T.pollS * 1000 * Math.min(8, 2 ** T.failures));
+}
+
+/** One marker per aircraft shown, labelled; placeTraffic moves them. */
+function drawTraffic() {
+  const T = S.traffic, box = $("traffic-layer");
+  const on = trafficWanted();
+  const shown = on ? trafficShown(T.aircraft, { hideGround: $("traffic-ground").checked }) : [];
+  const keep = new Set(shown.map((a) => a.id));
+  for (const [id, el] of T.els) if (!keep.has(id)) { el.remove(); T.els.delete(id); }
+  for (const a of shown) {
+    let el = T.els.get(a.id);
+    if (!el) {
+      el = trafficMarker();
+      T.els.set(a.id, el);
+      box.append(el);
+    }
+    el.ac = a;
+    el.classList.toggle("ground", a.onGround);
+    el.lastChild.textContent = `${label(a)} ${altitudeText(a)}`;
+    el.title = [label(a), a.reg !== label(a) ? a.reg : null, a.type, a.gsKt == null ? null : `${Math.round(a.gsKt)} kt`].filter(Boolean).join(" · ") + ". Click to follow.";
+  }
+  showTrafficStatus(shown.length);
+  placeTraffic();
+  if (shown.length && !T.loop) {
+    T.loop = true;
+    requestAnimationFrame(trafficTick);
+  }
+}
+
+function trafficMarker() {
+  const b = el("button", "ac");
+  b.type = "button";
+  b.innerHTML = `<svg viewBox="-17 -17 34 34" aria-hidden="true"><path d="M0 -15 L2.2 -6 L2.2 -2 L14 4 L14 7 L2.2 4 L1.8 11 L5.5 14 L5.5 16 L0 14.5 L-5.5 16 L-5.5 14 L-1.8 11 L-2.2 4 L-14 7 L-14 4 L-2.2 -2 L-2.2 -6 Z" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg><span></span>`;
+  b.onclick = () => {
+    const T = S.traffic;
+    startLive(b.ac, { source: T.source, pollS: T.pollS, now: Date.now() + T.offset });
+  };
+  return b;
+}
+
+/** Each aircraft where it is now: carried on from its report, like a followed one. */
+function placeTraffic() {
+  const T = S.traffic;
+  if (!T.els.size) return;
+  const now = Date.now() + T.offset;
+  for (const el of T.els.values()) {
+    const a = el.ac;
+    const st = S.geo && a.id !== S.live?.id ? liveStateAt([a.point], now) : null;
+    const p = st && S.geo.toPixel(st);
+    // Off the page, or where the chart isn't to scale (a profile, an inset): left out.
+    const inside = p && onSheet(p) && p[0] >= 0 && p[0] <= S.W && p[1] >= 0 && p[1] <= S.H && !notToScale(p[0] / S.W, p[1] / S.H);
+    el.hidden = !inside;
+    if (!inside) continue;
+    const [x, y] = screenOf(p);
+    el.style.transform = `translate(${x}px, ${y}px)`;
+    el.firstChild.style.transform = `rotate(${(a.trackDeg ?? 0) * Math.PI / 180 + S.geo.northAngle(st)}rad)`;
+    el.classList.toggle("stale", st.ageMs > 60000);
+  }
+}
+
+function trafficTick() {
+  const T = S.traffic;
+  if (!T.els.size) { T.loop = false; return; }
+  // Following already moves everything each frame.
+  if (!S.live) placeTraffic();
+  requestAnimationFrame(trafficTick);
+}
+
+function showTrafficStatus(shown) {
+  const T = S.traffic, box = $("traffic-status");
+  box.hidden = !trafficWanted();
+  if (box.hidden) return;
+  if (T.at == null) {
+    box.textContent = T.error ? `Couldn't get live aircraft: ${T.error}` : "Looking for aircraft on this chart…";
+    return;
+  }
+  const ground = $("traffic-ground").checked ? T.aircraft.filter((a) => a.onGround).length : 0;
+  const parts = [`${shown} aircraft on this chart`];
+  if (ground) parts.push(`${ground} on the ground hidden`);
+  parts.push(`as of ${clock(T.at)} Z`);
+  box.replaceChildren(parts.join(" · "), ". Click one to follow it.");
+  if (T.error) box.append(` Couldn't update (${T.error}); trying again.`);
 }
 
 // --- Altitude profile ---------------------------------------------------------
@@ -955,8 +1104,15 @@ function wireUi() {
   };
   document.addEventListener("visibilitychange", () => {
     // Hidden tabs don't ask; on return, catch up at once.
-    if (!document.hidden && S.live) poll();
+    if (document.hidden) return;
+    if (S.live) poll();
+    if (trafficWanted()) pollTraffic();
   });
+  const prefs = trafficPrefs();
+  $("traffic").checked = !!prefs.on;
+  $("traffic-ground").checked = !!prefs.hideGround;
+  $("traffic").onchange = () => { saveTrafficPrefs(); setTraffic(); };
+  $("traffic-ground").onchange = () => { saveTrafficPrefs(); drawTraffic(); };
 
   const icao = $("icao");
   icao.oninput = () => {
